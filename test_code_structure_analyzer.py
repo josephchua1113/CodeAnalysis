@@ -43,10 +43,14 @@ REPO = {
         "import { api } from './api.js';\n"
         "export function loadOrders(userId, page) { return api.get('/orders'); }\n"
         "const formatPrice = (amount, currency) => `${amount} ${currency}`;\n"
-        "export class OrderTable extends BaseTable {\n  render(rows) { return rows.length; }\n}\n"),
+        "export const API_URL = '/api';\n"
+        "export class OrderTable extends BaseTable {\n  render(rows) { return rows.length; }\n"
+        "  static create(x) { return x; }\n}\n"),
     "src/main/resources/static/js/order-api.ts": (
         "export interface OrderDto { id: string; total: number; }\n"
         "export type Status = 'new' | 'paid';\n"
+        "export enum Color { Red, Green }\n"
+        "export const MAX_ROWS: number = 5;\n"
         "export async function fetchOrder(id: string, opts?: RequestInit): Promise<OrderDto> { return {} as OrderDto; }\n"),
     "src/main/java/module-info.java": "module com.acme.shop { requires java.sql; exports com.acme.shop.order; }\n",
     "src/main/java/Main.java": 'String greeting = "hi";\nvoid main() {\n    System.out.println(greeting);\n}\nint add(int a, int b) { return a + b; }\n',
@@ -67,6 +71,7 @@ public class OrderService implements OrderOperations<Order> {
     private final Map<String, List<Order>> cache = new HashMap<String, List<Order>>();
     private Runnable hook = new Runnable() { public void run() { System.out.println("x"); } };
     int[] counts, totals[];
+    static int instances = 0;
 
     static { System.out.println("loaded"); }
 
@@ -584,6 +589,78 @@ class AnalyzerTests(unittest.TestCase):
             fh.write(js)
         r = subprocess.run([node, "--check", path], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_js_ts_identifiers(self):
+        js = {s["n"]: s for s in self.files["src/main/resources/static/js/app.js"]["sym"]}
+        self.assertEqual(js["API_URL"]["k"], "const")
+        self.assertEqual(js["formatPrice"].get("decl"), "const")
+        self.assertTrue(js["create"].get("static"))
+        self.assertFalse(js["render"].get("static", False))
+        ts = {s["n"]: s for s in self.files["src/main/resources/static/js/order-api.ts"]["sym"]}
+        self.assertEqual(ts["Color"]["k"], "enum")
+        self.assertEqual(ts["MAX_ROWS"]["k"], "const")
+        self.assertEqual(ts["MAX_ROWS"]["r"], "number")
+
+    def _browser(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest("playwright not installed")
+        return sync_playwright
+
+    def test_report_expand_all_and_identifiers(self):
+        sync_playwright = self._browser()
+        errors = []
+        n_methods = len(self.methods)
+        with sync_playwright() as p:
+            exe = shutil.which("google-chrome") or shutil.which("chromium") or None
+            try:
+                b = p.chromium.launch(executable_path=exe, args=["--no-sandbox"]) if exe else p.chromium.launch()
+            except Exception as e:  # noqa
+                self.skipTest("no browser available: %s" % e)
+            pg = b.new_page(viewport={"width": 1400, "height": 900})
+            pg.on("pageerror", lambda e: errors.append(str(e)))
+            pg.goto("file://" + os.path.abspath(self.report).replace("\\", "/"))
+            pg.click("#tabs button[data-tab=structure]")
+            # ---- expand all
+            self.assertEqual(pg.inner_text("#expand"), "Expand all")
+            pg.click("#expand")
+            pg.wait_for_function("document.querySelector('#expand').textContent === 'Expand all' && !document.querySelector('#expand').disabled")
+            self.assertEqual(pg.locator("#tree details:not([open])").count(), 0)
+            self.assertEqual(pg.locator("#tree .m[data-m]").count(), n_methods)  # every Java method rendered
+            # ---- identifiers
+            row = lambda sel, text: pg.locator(sel, has_text=text).first.inner_html()
+            self.assertIn("id-const", row(".fld", "MAX_ITEMS"))                 # static final -> const
+            self.assertIn("id-const", row(".fld", "defaultCurrency"))           # static final String -> const
+            self.assertIn("id-static", row(".fld", "instances"))                # static, not final -> static
+            self.assertNotIn("id-const", row(".fld", "instances"))
+            self.assertIn("id-field", row(".fld", "cache"))                     # private final -> final field
+            self.assertIn("id-fn", row(".m", "cancel"))                          # method -> function
+            self.assertIn("id-static", pg.locator(".m[data-m=%s]" % self.mid("OrderStatus", "fromCode")).inner_html())
+            self.assertIn("id-ctor", pg.locator(".m[data-m=%s]" % [m for m in self.T("Order")["fn"] if m["k"] == "ctor"][0]["id"]).inner_html())
+            self.assertEqual(pg.locator(".fld.enumval").count(), 3)            # NEW, PAID, CANCELLED
+            self.assertIn("id-enum", pg.locator("details[data-key='t:%s'] > summary" % self.T("OrderStatus")["id"]).inner_html())
+            self.assertIn("id-static", pg.locator("details[data-key='t:%s'] > summary" % self.T("OrderService.Builder")["id"]).inner_html())
+            self.assertGreater(pg.locator("#tree .m .id-const").count(), 0)    # JS const function
+            # ---- data type identifiers
+            dt = lambda t: pg.evaluate("t => dtype(t)[0]", t)
+            self.assertEqual(dt("int"), "primitive")
+            self.assertEqual(dt("int[][]"), "primitive")
+            self.assertEqual(dt("String"), "value")
+            self.assertEqual(dt("List<? extends OrderItem>"), "collection")
+            self.assertEqual(dt("Order"), "project")
+            self.assertEqual(dt("OrderStatus"), "enum")
+            self.assertEqual(dt("T..."), "generic")
+            self.assertEqual(dt("java.io.IOException"), "library")
+            self.assertEqual(dt("@Valid CreateOrderRequest"), "project")
+            self.assertGreater(pg.locator("#tree .dt-primitive").count(), 0)
+            self.assertGreater(pg.locator("#tree .dt-enum").count(), 0)
+            self.assertIn("Identifiers", pg.inner_text("#idlegend"))
+            # ---- collapse all still works
+            pg.click("#collapse")
+            self.assertEqual(pg.locator("#tree details[open]").count(), 1)
+            b.close()
+        self.assertEqual(errors, [])
 
     def test_report_in_browser(self):
         try:

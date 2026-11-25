@@ -80,7 +80,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Extensions that get a code outline (all other files are still listed and read).
 JAVA_EXTS = ("java",)
@@ -938,6 +938,7 @@ _JS_PATTERNS = [
     ("class", re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)"
                          r"(?:\s+extends\s+([\w$.]+))?", re.M)),
     ("interface", re.compile(r"^\s*(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)", re.M)),
+    ("enum", re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)", re.M)),
     ("type", re.compile(r"^\s*(?:export\s+)?type\s+([A-Za-z_$][\w$]*)\s*(?:<[^=]*>)?\s*=", re.M)),
     ("function", re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*"
                             r"([A-Za-z_$][\w$]*)\s*(<[^>(]*>)?\s*\(([^)]*)\)\s*(?::\s*([^{;=]+))?", re.M)),
@@ -946,7 +947,9 @@ _JS_PATTERNS = [
     ("method", re.compile(r"^\s+(?:public\s+|private\s+|protected\s+|static\s+|async\s+|readonly\s+)*"
                           r"(?!if\b|for\b|while\b|switch\b|catch\b|return\b|function\b)"
                           r"([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*(?::\s*([^{;]+))?\s*\{", re.M)),
+    ("const", re.compile(r"^(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*(?::\s*([^=]+?))?\s*=", re.M)),
 ]
+_JS_DECL = re.compile(r"\s*(?:export\s+)?(const|let|var)\b")
 _JS_IMPORT = re.compile(r"^\s*import\s+.*?from\s+['\"]([^'\"]+)['\"]|require\(\s*['\"]([^'\"]+)['\"]\s*\)", re.M)
 
 
@@ -973,6 +976,14 @@ def outline_js(src):
                     s["r"] = ret.strip()
             if kind == "class" and m.group(2):
                 s["ext"] = m.group(2)
+            if kind == "function":
+                d = _JS_DECL.match(m.group(0))
+                if d:
+                    s["decl"] = d.group(1)
+            if kind == "method" and re.search(r"\bstatic\b", src[m.start():m.start(1)]):
+                s["static"] = True
+            if kind == "const" and m.group(2):
+                s["r"] = m.group(2).strip()
             syms.append(s)
     syms.sort(key=lambda s: s["l"])
     imps = [a or b for a, b in _JS_IMPORT.findall(src)]
@@ -1911,6 +1922,26 @@ summary:hover,.m:hover,.fld:hover,.row:hover{background:var(--soft)}
 .chip.ok{background:var(--oks);border-color:#c5e3c7;color:var(--ok)}
 .chip.warn{background:var(--warns);border-color:#f0d3b1;color:var(--warn)}
 .chip.anno{color:#7a6a20;border-color:#ece2b5;background:#fbf7e6}
+.id{display:inline-block;font:700 9.5px/14px system-ui,sans-serif;padding:0 5px;border-radius:3px;letter-spacing:.2px;white-space:nowrap;border:1px solid transparent}
+.id-fn{background:#e9effc;color:#2b59c3;border-color:#c9d6f5}
+.id-ctor{background:#e3f4f4;color:#0f6f78;border-color:#bfe2e4}
+.id-init{background:#eeeeea;color:#6b6b70;border-color:#deded9}
+.id-const{background:#fdecea;color:#b3261e;border-color:#f5c9c4}
+.id-static{background:#fff3d1;color:#8a6100;border-color:#f0dc9c}
+.id-enum{background:#fdeedd;color:#b35c00;border-color:#f3d2ad}
+.id-field{background:#f1f1ed;color:#5f6b7a;border-color:#e0e0db}
+.id-type{background:#e9effc;color:#2b59c3;border-color:#c9d6f5}
+.id-abstract{background:#f3eafa;color:#8a44b3;border-color:#e2cff1}
+.dt-primitive{color:#b35c00}
+.dt-value{color:#0f7b5f}
+.dt-collection{color:#8a44b3}
+.dt-project{color:#2b59c3;font-weight:600}
+.dt-enum{color:#c26a00;font-weight:600}
+.dt-generic{color:#6b6b70;font-style:italic}
+.dt-library{color:#1f4e8c}
+.legend-row{display:flex;flex-wrap:wrap;gap:4px 6px;align-items:center;font-size:11.5px;color:var(--muted);margin:0 0 10px}
+.legend-row .sp{width:10px}
+.legend-row .ty{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .ic{display:inline-block;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;font:700 9.5px system-ui,sans-serif;color:#fff;margin-right:5px;vertical-align:1px}
 .ic.dir{background:none;color:#a08a3c;font-size:12px;border-radius:2px}
 .ic.class{background:#2b59c3}.ic.interface{background:#2e8b57}.ic.enum{background:#c77d1a}.ic.record{background:#13838f}
@@ -1983,7 +2014,26 @@ h2{font-size:15px;margin:18px 0 8px}
         <input id="q" placeholder="Search class, method, file, or object type (min 2 chars)…" autocomplete="off">
         <label><input type="checkbox" id="optPriv" checked> private</label>
         <label><input type="checkbox" id="optFields" checked> fields</label>
+        <button id="expand">Expand all</button>
         <button id="collapse">Collapse all</button>
+      </div>
+      <div class="legend-row" id="idlegend">
+        <b>Identifiers:</b>
+        <span class="id id-fn">ƒ</span>function
+        <span class="id id-ctor">ctor</span>constructor
+        <span class="id id-const">const</span>constant
+        <span class="id id-static">static</span>static
+        <span class="id id-enum">enum</span>enum
+        <span class="id id-type">class</span>data type
+        <span class="id id-field">var</span>field
+        <span class="sp"></span><b>Data types:</b>
+        <span class="ty dt-primitive">int</span>primitive
+        <span class="ty dt-value">String</span>value
+        <span class="ty dt-collection">List</span>collection
+        <span class="ty dt-project">Order</span>defined in repo
+        <span class="ty dt-enum">Status</span>enum in repo
+        <span class="ty dt-library">Pool</span>library/JDK
+        <span class="ty dt-generic">T</span>generic
       </div>
       <div id="results" class="hide"></div>
       <div id="tree"></div>
@@ -2035,7 +2085,85 @@ function vis(mods, t) {
   if (t && (t.k === 'interface' || t.k === 'annotation')) return ['pub', '+'];
   return ['pkg', '~'];
 }
-const ty = s => `<span class="ty">${esc(s)}</span>`;
+const PRIM = new Set(['int', 'long', 'short', 'byte', 'char', 'boolean', 'float', 'double', 'void', 'var',
+  'string', 'number', 'bigint', 'symbol', 'any', 'unknown', 'never', 'undefined', 'null', 'object']);
+const VALUE = new Set(['String', 'Integer', 'Long', 'Short', 'Byte', 'Character', 'Boolean', 'Float', 'Double', 'Object',
+  'Number', 'BigDecimal', 'BigInteger', 'CharSequence', 'UUID', 'Date', 'LocalDate', 'LocalDateTime', 'LocalTime',
+  'Instant', 'ZonedDateTime', 'OffsetDateTime', 'Duration', 'Period', 'Class', 'Void', 'StringBuilder']);
+const COLL = new Set(['List', 'ArrayList', 'LinkedList', 'Set', 'HashSet', 'TreeSet', 'LinkedHashSet', 'SortedSet',
+  'Map', 'HashMap', 'TreeMap', 'LinkedHashMap', 'SortedMap', 'ConcurrentHashMap', 'ConcurrentMap', 'Collection',
+  'Iterable', 'Iterator', 'Queue', 'Deque', 'ArrayDeque', 'Stream', 'Optional', 'Vector', 'Hashtable', 'Enumeration',
+  'Page', 'Slice', 'Flux', 'Mono', 'CompletableFuture', 'Future', 'Array', 'Record', 'Promise', 'ReadonlyArray', 'Multimap']);
+const DT_LABEL = {primitive: 'primitive', value: 'built-in value type', collection: 'collection / container',
+  project: 'type defined in this repo', enum: 'enum defined in this repo', generic: 'generic type parameter',
+  library: 'library / JDK type'};
+let PROJ = null;
+function projTypes() {
+  if (PROJ) return PROJ;
+  PROJ = new Map();
+  for (const id in TY) { const t = TY[id]; if (t.k !== 'anonymous' && t.k !== 'enum constant') PROJ.set(t.n, t.k); }
+  for (const f of D.files) for (const s of (f.sym || [])) if (['class', 'interface', 'type', 'enum'].includes(s.k)) PROJ.set(s.n, s.k);
+  return PROJ;
+}
+function dtype(s) {
+  let b = String(s || '').replace(/@[\w.]+(\([^)]*\))?\s*/g, '').trim();
+  const arr = /\[\]|\.\.\.$/.test(b.replace(/<.*>/, ''));
+  b = b.replace(/<.*$/, '').replace(/\[\]|\.\.\./g, '').trim();
+  const simple = b.split('.').pop();
+  let c;
+  if (PRIM.has(simple)) c = 'primitive';
+  else if (VALUE.has(simple)) c = 'value';
+  else if (COLL.has(simple)) c = 'collection';
+  else {
+    const k = projTypes().get(simple);
+    if (k) c = k === 'enum' ? 'enum' : 'project';
+    else if (/^[A-Z][0-9]?$/.test(simple)) c = 'generic';
+    else c = 'library';
+  }
+  return [c, arr];
+}
+const ty = s => { const d = dtype(s); return `<span class="ty dt-${d[0]}" title="data type: ${DT_LABEL[d[0]]}${d[1] ? ' (array)' : ''}">${esc(s)}</span>`; };
+const KIND_LABEL = {class: 'class', interface: 'interface', enum: 'enum', record: 'record', annotation: '@annotation',
+  anonymous: 'anonymous class', 'enum constant': 'enum value body'};
+function typeIds(t) {
+  const mods = t.m || [];
+  let h = `<span class="id ${t.k === 'enum' || t.k === 'enum constant' ? 'id-enum' : 'id-type'}" title="data type: ${esc(t.k)}">${KIND_LABEL[t.k] || esc(t.k)}</span>`;
+  if (mods.includes('static')) h += '<span class="id id-static" title="static nested type">static</span>';
+  if (mods.includes('abstract')) h += '<span class="id id-abstract">abstract</span>';
+  if (mods.includes('sealed')) h += '<span class="id id-abstract">sealed</span>';
+  return h;
+}
+function methodIds(m) {
+  const mods = m.m || [];
+  let h;
+  if (m.k === 'ctor') h = '<span class="id id-ctor" title="constructor">ctor</span>';
+  else if (m.k === 'init') h = '<span class="id id-init" title="initializer block">init</span>';
+  else h = '<span class="id id-fn" title="function / method">ƒ</span>';
+  if (mods.includes('static')) h += '<span class="id id-static" title="static">static</span>';
+  if (mods.includes('abstract')) h += '<span class="id id-abstract">abstract</span>';
+  if (mods.includes('default')) h += '<span class="id id-abstract">default</span>';
+  return h;
+}
+function fieldIds(fl, t) {
+  const mods = fl.m || [];
+  const iface = t && (t.k === 'interface' || t.k === 'annotation');
+  const st = mods.includes('static') || iface, fin = mods.includes('final') || iface;
+  if (st && fin) return '<span class="id id-const" title="constant (static final)">const</span>';
+  let h = st ? '<span class="id id-static" title="static field">static</span>' : '';
+  h += fin ? '<span class="id id-field" title="final field">final</span>' : '<span class="id id-field" title="field / variable">var</span>';
+  return h;
+}
+function symIds(s) {
+  if (s.k === 'function' || s.k === 'method') {
+    let h = '<span class="id id-fn" title="function">ƒ</span>';
+    if (s.decl === 'const') h += '<span class="id id-const" title="declared with const">const</span>';
+    if (s.static) h += '<span class="id id-static">static</span>';
+    return h;
+  }
+  if (s.k === 'const') return '<span class="id id-const" title="constant">const</span>';
+  if (s.k === 'enum') return '<span class="id id-enum">enum</span>';
+  return `<span class="id id-type" title="data type">${esc(s.k)}</span>`;
+}
 function paramsHTML(m) {
   const ps = m.p || [];
   if (!ps.length) return '<span class="none">none</span>';
@@ -2141,7 +2269,8 @@ function symRow(s) {
   const io = (s.k === 'function' || s.k === 'method')
     ? `<span class="io"><span class="tag in">IN</span>${s.p ? esc(s.p) : '<span class="none">none</span>'}</span><span class="io"><span class="tag out">OUT</span>${s.r ? ty(s.r) : '<span class="none">not declared</span>'}</span>`
     : (s.ext ? `<span class="muted">extends ${esc(s.ext)}</span>` : '');
-  r.innerHTML = `<span class="k">${esc(s.k)}</span><span class="nm">${esc(s.n)}</span>${io}<span class="ln">L${s.l}</span>`;
+  const typ = s.k === 'const' && s.r ? ty(s.r) : '';
+  r.innerHTML = `${symIds(s)}<span class="nm">${esc(s.n)}</span>${typ}${io}<span class="ln">L${s.l}</span>`;
   return r;
 }
 function typeEl(t) {
@@ -2154,11 +2283,14 @@ function typeEl(t) {
   else if (t.tc && t.tc.length) badge = '<span class="chip ok">✓ has test class</span>';
   const v = vis(t.m, t._p);
   const d = mk('t:' + t.id,
-    `${icon(t.k)}<b>${esc(t.n)}</b>${t.tp ? '<span class="ty">' + esc(t.tp) + '</span>' : ''}${heads.length ? ' <span class="muted mono" style="font-size:11.5px">' + esc(heads.join(' ')) + '</span>' : ''}${annoChips(t.a)}${badge}<span class="cnt">L${t.l}${nf ? ' · ' + nf + ' fields' : ''}${nm ? ' · ' + nm + ' methods' : ''}</span>`,
+    `${icon(t.k)}${typeIds(t)} <b>${esc(t.n)}</b>${t.tp ? '<span class="ty">' + esc(t.tp) + '</span>' : ''}${heads.length ? ' <span class="muted mono" style="font-size:11.5px">' + esc(heads.join(' ')) + '</span>' : ''}${annoChips(t.a)}${badge}<span class="cnt">L${t.l}${nf ? ' · ' + nf + ' fields' : ''}${nm ? ' · ' + nm + ' methods' : ''}</span>`,
     el => {
       if (t.c && t.c.length) {
-        const c = document.createElement('div'); c.className = 'note mono';
-        c.textContent = 'constants: ' + t.c.join(', '); el.appendChild(c);
+        t.c.forEach(name => {
+          const c = document.createElement('div'); c.className = 'fld enumval';
+          c.innerHTML = `<span class="vis pub">+</span><span class="id id-const" title="constant">const</span><span class="id id-enum">enum value</span><span class="ty dt-enum">${esc(t.n)}</span> <span>${esc(name)}</span>`;
+          el.appendChild(c);
+        });
       }
       if (nf) {
         const g = mk('F:' + t.id, `Fields (${nf})`, ge => t.f.forEach(fl => ge.appendChild(fieldRow(fl, t))), 'fields');
@@ -2176,8 +2308,7 @@ function fieldRow(fl, t) {
   const r = document.createElement('div');
   const v = vis(fl.m, t);
   r.className = 'fld' + (v[0] === 'priv' ? ' priv-row' : '');
-  const mods = (fl.m || []).filter(x => x === 'static' || x === 'final').join(' ');
-  r.innerHTML = `<span class="vis ${v[0]}">${v[1]}</span>${mods ? '<span class="k">' + esc(mods) + '</span>' : ''}${ty(fl.t)} <span>${esc(fl.n)}</span>${annoChips(fl.a, 2)}${fl.mock ? '<span class="chip">mock</span>' : ''}${fl.comp ? '<span class="chip">component</span>' : ''}<span class="ln">L${fl.l}</span>`;
+  r.innerHTML = `<span class="vis ${v[0]}">${v[1]}</span>${fieldIds(fl, t)}${ty(fl.t)} <span>${esc(fl.n)}</span>${annoChips(fl.a, 2)}${fl.mock ? '<span class="chip">mock</span>' : ''}${fl.comp ? '<span class="chip">component</span>' : ''}<span class="ln">L${fl.l}</span>`;
   return r;
 }
 function methodRow(m) {
@@ -2185,9 +2316,8 @@ function methodRow(m) {
   const v = vis(m.m, m._t);
   r.className = 'm' + (v[0] === 'priv' ? ' priv-row' : '');
   r.dataset.m = m.id;
-  const kind = m.k === 'ctor' ? 'ctor' : m.k === 'init' ? 'init' : ((m.m || []).includes('static') ? 'static' : '');
   const annos = (m.a || []).filter(a => a !== 'Override');
-  r.innerHTML = `<span class="vis ${v[0]}">${v[1]}</span>${kind ? '<span class="k">' + kind + '</span>' : ''}<span class="nm">${esc(m.n)}</span>`
+  r.innerHTML = `<span class="vis ${v[0]}">${v[1]}</span>${methodIds(m)}<span class="nm">${esc(m.n)}</span>`
     + (m.k !== 'init' ? `<span class="io"><span class="tag in">IN</span>${paramsHTML(m)}</span><span class="io"><span class="tag out">OUT</span>${outHTML(m)}</span>` : '')
     + (m.th ? `<span class="muted">throws ${esc(m.th.join(', '))}</span>` : '')
     + annoChips(annos, 2) + testBadge(m) + `<span class="ln">L${m.l}</span>`;
@@ -2300,12 +2430,12 @@ function showMethod(id) {
       cls ? 'Its class has a test class (' + t.tc.map(tLink).join(', ') + ') but no test calls this method directly.' : 'No test calls this method directly.');
   }
   P.innerHTML = `<div class="muted">${esc(m.k === 'ctor' ? 'constructor' : m.k === 'init' ? 'initializer' : 'method')} in ${tLink(t.id)}</div>
-    <h3>${esc(t.n)}.${esc(m.n)}</h3>
+    <h3>${methodIds(m)} ${esc(t.n)}.${esc(m.n)}</h3>
     <div class="muted">${fLink(f.p)} : L${m.l}${m.e && m.e !== m.l ? '–' + m.e : ''} · ${lines} line${lines > 1 ? 's' : ''}${m.b ? '' : ' · no body'}</div>
     <pre class="sig">${esc(sigText(m))}</pre>
     ${m.a ? '<div>' + annoChips(m.a, 20) + '</div>' : ''}
     ${m.d ? `<p class="muted">${esc(m.d)}</p>` : ''}
-    ${m.k !== 'init' ? `<h4><span class="tag in">IN</span> Inputs (${(m.p || []).length})</h4>${rows ? '<table><tr><th>#</th><th>Type (object)</th><th>Name</th><th>Annotations</th></tr>' + rows + '</table>' : '<p class="muted">No parameters</p>'}
+    ${m.k !== 'init' ? `<h4><span class="tag in">IN</span> Inputs (${(m.p || []).length})</h4>${rows ? '<table><tr><th>#</th><th>Data type (object)</th><th>Name</th><th>Annotations</th></tr>' + rows + '</table>' : '<p class="muted">No parameters</p>'}
     <h4><span class="tag out">OUT</span> Output</h4><div class="mono">${outHTML(m)}</div>
     ${m.th ? `<h4>Throws</h4><div class="mono">${esc(m.th.join(', '))}</div>` : ''}` : ''}
     ${tests}`;
@@ -2313,13 +2443,13 @@ function showMethod(id) {
 function showType(id) {
   const t = TY[id]; if (!t) return;
   const f = t._f;
-  const fr = (t.f || []).map(x => `<tr><td class="mono">${(x.m || []).map(esc).join(' ')}</td><td class="mono">${ty(x.t)}</td><td class="mono">${esc(x.n)}</td></tr>`).join('');
-  const mr = (t.fn || []).map(m => `<tr><td>${mLink(m.id)}${testBadge(m)}</td><td class="mono" style="font-size:11.5px">${m.k === 'init' ? '' : paramsHTML(m)}</td><td class="mono" style="font-size:11.5px">${outHTML(m)}</td></tr>`).join('');
+  const fr = (t.f || []).map(x => `<tr><td>${fieldIds(x, t)}</td><td class="mono">${(x.m || []).map(esc).join(' ')}</td><td class="mono">${ty(x.t)}</td><td class="mono">${esc(x.n)}</td></tr>`).join('');
+  const mr = (t.fn || []).map(m => `<tr><td>${methodIds(m)} ${mLink(m.id)}${testBadge(m)}</td><td class="mono" style="font-size:11.5px">${m.k === 'init' ? '' : paramsHTML(m)}</td><td class="mono" style="font-size:11.5px">${outHTML(m)}</td></tr>`).join('');
   let tests = '';
   if (t.test) tests = `<h4>Class under test (technique 1: name)</h4>` + (t.tf ? tLink(t.tf) : `<p class="muted">${t.tf_missing ? 'No class named ' + esc(t.tf_missing) + ' found in main code' : 'Name does not follow a test naming pattern'}</p>`);
   else if (t.k !== 'interface' && t.k !== 'annotation') tests = `<h4>Test classes (technique 1: name)</h4>` + list(t.tc, tLink, 'No test class with a matching name');
   P.innerHTML = `<div class="muted">${esc(t.k)}${t._p ? ' nested in ' + tLink(t._p.id) : ''}${f.pkg ? ' · package ' + esc(f.pkg) : ''}</div>
-    <h3>${icon(t.k)}${esc(t.n)}${t.tp ? '<span class="ty">' + esc(t.tp) + '</span>' : ''}</h3>
+    <h3>${icon(t.k)}${typeIds(t)} ${esc(t.n)}${t.tp ? '<span class="ty">' + esc(t.tp) + '</span>' : ''}</h3>
     <div class="muted">${fLink(f.p)} : L${t.l}–${t.e || t.l}</div>
     ${(t.m && t.m.length) ? '<div class="muted mono" style="margin-top:6px">' + esc(t.m.join(' ')) + '</div>' : ''}
     ${t.a ? '<div style="margin-top:4px">' + annoChips(t.a, 20) + '</div>' : ''}
@@ -2329,7 +2459,7 @@ function showType(id) {
     ${t.perm && t.perm.length ? `<h4>Permits</h4><div class="mono">${t.perm.map(ty).join(', ')}</div>` : ''}
     ${t.c ? `<h4>Constants (${t.c.length})</h4><div class="mono">${esc(t.c.join(', '))}</div>` : ''}
     ${tests}
-    <h4>Fields (${(t.f || []).length})</h4>${fr ? '<table><tr><th>Modifiers</th><th>Type</th><th>Name</th></tr>' + fr + '</table>' : '<p class="muted">None</p>'}
+    <h4>Fields (${(t.f || []).length})</h4>${fr ? '<table><tr><th>Kind</th><th>Modifiers</th><th>Data type</th><th>Name</th></tr>' + fr + '</table>' : '<p class="muted">None</p>'}
     <h4>Methods (${(t.fn || []).length})</h4>${mr ? '<table><tr><th>Name</th><th><span class="tag in">IN</span></th><th><span class="tag out">OUT</span></th></tr>' + mr + '</table>' : '<p class="muted">None</p>'}
     ${t.nt && t.nt.length ? '<h4>Nested types</h4>' + list(t.nt.map(x => x.id), tLink, '') : ''}`;
 }
@@ -2348,6 +2478,7 @@ function introPanel() {
   P.innerHTML = `<h3>How to read this report</h3>
   <p class="muted"><b>Structure</b>: expand folders → files → classes → methods. Each method shows <span class="tag in">IN</span> parameter types (objects) and names, and <span class="tag out">OUT</span> the return type.</p>
   <p class="muted">Visibility: <span class="vis pub mono">+</span> public · <span class="vis prot mono">#</span> protected · <span class="vis pkg mono">~</span> package · <span class="vis priv mono">−</span> private.</p>
+  <p class="muted"><b>Expand all</b> opens every folder, file, class and method; <b>Collapse all</b> closes them. The coloured labels (ƒ function, const, static, enum, class…) and the colours of data types are explained above the tree.</p>
   <p class="muted">Click any class, method or file to see details here. Switch <b>Folders / Packages</b> at the top of the Structure tab.</p>
   <p class="muted"><b>Tests</b>: <span class="chip ok">✓ tested</span> = a test method calls this method directly (technique 3). “strong” = that test also belongs to the matching test class by name (technique 1 + 3).</p>`;
 }
@@ -2392,6 +2523,21 @@ function syncSeg() { document.querySelectorAll('#viewseg button').forEach(b => b
 document.querySelectorAll('#viewseg button').forEach(b => b.onclick = () => { VIEW = b.dataset.view; syncSeg(); renderTree(); });
 $('#optPriv').onchange = e => $('#tree').classList.toggle('hide-priv', !e.target.checked);
 $('#optFields').onchange = e => $('#tree').classList.toggle('hide-fields', !e.target.checked);
+$('#expand').onclick = expandAll;
+function expandAll() {
+  const tree = $('#tree'), btn = $('#expand');
+  const total = M.methods || 0;
+  if (total > 40000 && !confirm('This repo has ' + fmtN(total) + ' methods. Expanding everything may take a while. Continue?')) return;
+  btn.disabled = true; btn.textContent = 'Expanding…';
+  (function step() {
+    const closed = tree.querySelectorAll('details:not([open])');
+    if (!closed.length) { btn.disabled = false; btn.textContent = 'Expand all'; return; }
+    let n = 0;
+    for (const d of closed) { if (d.closest('.hide')) continue; openD(d); if (++n >= 500) break; }
+    if (!n) { btn.disabled = false; btn.textContent = 'Expand all'; return; }
+    requestAnimationFrame(step);
+  })();
+}
 $('#collapse').onclick = () => document.querySelectorAll('#tree details').forEach((d, i) => { if (i > 0) d.open = false; });
 
 /* ---------------- global click handling ---------------- */
