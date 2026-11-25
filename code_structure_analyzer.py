@@ -80,7 +80,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
-VERSION = "1.3.0"
+VERSION = "1.6.0"
 
 # Extensions that get a code outline (all other files are still listed and read).
 JAVA_EXTS = ("java",)
@@ -2055,7 +2055,8 @@ def write_outputs(out_dir, report_file, files, analysis, no_html):
     html_path = None
     if not no_html:
         html_path = report_file
-        payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+        page_data = {k: v for k, v in data.items() if k not in ("coverage", "untested", "folders", "packages")}
+        payload = json.dumps(page_data, separators=(",", ":"), ensure_ascii=False)
         payload = payload.replace("</", "<\\/").replace("<!--", "<\\!--")
         page = HTML_TEMPLATE.replace("__TITLE__", _html_escape(data["meta"]["project"])) \
                             .replace("__DATA__", payload)
@@ -2243,6 +2244,11 @@ summary:hover,.m:hover,.fld:hover,.row:hover{background:var(--soft)}
 .legend-row .sp{width:10px}
 .cc{color:var(--muted);font:10.5px system-ui,sans-serif;white-space:nowrap}
 .cc.zero{color:#c0392b}
+.steps{display:inline-block;min-width:24px;text-align:center;font-weight:700;font-size:12px;background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:0 6px}
+tr.entry .steps{background:#e9effc;border-color:#c9d6f5;color:#2b59c3}
+.chip.ep{background:#e9effc;border-color:#c9d6f5;color:#2b59c3}
+.only-entry tr.mid{display:none}
+.path{margin-top:1px}
 #panel tr.call-x td,#panel tr.call-u td{color:var(--muted)}
 .only-repo tr.call-x,.only-repo tr.call-u{display:none}
 .callsig{color:var(--muted);font-size:11px}
@@ -2306,8 +2312,6 @@ h2{font-size:15px;margin:18px 0 8px}
 <nav id="tabs">
   <button data-tab="overview" class="on">Overview</button>
   <button data-tab="structure">Structure</button>
-  <button data-tab="tests">Tests</button>
-  <button data-tab="patterns">Patterns</button>
   <button data-tab="odd">Odd ones out</button>
 </nav>
 <main>
@@ -2319,7 +2323,7 @@ h2{font-size:15px;margin:18px 0 8px}
         <input id="q" placeholder="Search class, method, file, or object type (min 2 chars)…" autocomplete="off">
         <label><input type="checkbox" id="optPriv" checked> private</label>
         <label><input type="checkbox" id="optFields" checked> fields</label>
-        <button id="expandFn" title="Open folders, files and classes so every function is visible (field lists stay closed)">Expand functions</button>
+        <button id="expandFn" title="Open folders, files and classes so every function is visible. Field lists, test files and test classes stay closed.">Expand functions</button>
         <button id="expand" title="Open everything, including field lists">Expand all</button>
         <button id="collapse">Collapse all</button>
       </div>
@@ -2345,8 +2349,6 @@ h2{font-size:15px;margin:18px 0 8px}
       <div id="results" class="hide"></div>
       <div id="tree"></div>
     </div>
-    <div class="tab" id="t-tests"></div>
-    <div class="tab" id="t-patterns"></div>
     <div class="tab" id="t-odd"></div>
   </section>
   <aside id="panel"></aside>
@@ -2560,7 +2562,7 @@ function fileEl(f) {
   if (f.ln) meta.push(fmtN(f.ln) + ' lines');
   const d = mk('f:' + f.p,
     `<span class="ic file">▤</span><span class="fn">${esc(fname(f.p))}</span>${f.test ? '<span class="chip test">test</span>' : ''}${f.err || f.skipped ? '<span class="chip warn">⚠</span>' : ''}<span class="cnt">${esc(meta.join(' · '))}</span>`,
-    el => fillFile(el, f), 'file');
+    el => fillFile(el, f), f.test ? 'file testfile' : 'file');
   d.dataset.path = f.p;
   return d;
 }
@@ -2608,6 +2610,7 @@ function typeEl(t) {
       (t.nt || []).forEach(c => el.appendChild(typeEl(c)));
     });
   if (v[0] === 'priv') d.classList.add('priv-row');
+  if (t.test) d.classList.add('testclass');
   d.querySelector('summary').dataset.type = t.id;
   return d;
 }
@@ -2617,6 +2620,101 @@ function fieldRow(fl, t) {
   r.className = 'fld' + (v[0] === 'priv' ? ' priv-row' : '');
   r.innerHTML = `<span class="vis ${v[0]}">${v[1]}</span>${fieldIds(fl, t)}${ty(fl.t)} <span>${esc(fl.n)}</span>${annoChips(fl.a, 2)}${fl.mock ? '<span class="chip">mock</span>' : ''}${fl.comp ? '<span class="chip">component</span>' : ''}<span class="ln">L${fl.l}</span>`;
   return r;
+}
+/* ---------- all callers (direct + indirect) with number of steps, and entry points ---------- */
+const MAX_STEPS = 15, MAX_CALLERS = 3000;
+const ENDPOINT_ANNOS = new Set(['GetMapping', 'PostMapping', 'PutMapping', 'DeleteMapping', 'PatchMapping', 'RequestMapping',
+  'GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'Path', 'WebMethod', 'MessageMapping', 'SubscribeMapping', 'QueryMapping', 'MutationMapping']);
+const FRAMEWORK_ANNOS = new Set(['Scheduled', 'EventListener', 'TransactionalEventListener', 'KafkaListener', 'JmsListener',
+  'RabbitListener', 'SqsListener', 'StreamListener', 'PostConstruct', 'PreDestroy', 'Bean', 'Observes', 'Schedule', 'Startup']);
+function callersOf(id) {
+  if (id[0] === 'T') {          // field initializers run when an object of the type is created
+    const t = TY[id]; const out = new Set();
+    (t ? t.fn || [] : []).forEach(c => { if (c.k === 'ctor') (c.cb || []).forEach(x => out.add(x)); });
+    return [...out];
+  }
+  const m = ME[id];
+  return m ? (m.cb || []).filter(x => x !== id) : [];
+}
+function nodeName(id) {
+  if (id[0] === 'T') return TY[id] ? TY[id].n + ' (field initializer)' : id;
+  const m = ME[id]; if (!m) return id;
+  const overloaded = (m._t.fn || []).filter(x => x.n === m.n).length > 1;
+  const sig = overloaded ? '(' + (m.p || []).map(p => _simpleType(p[1])).join(', ') + ')' : '';
+  return m._t.n + '.' + m.n + sig;
+}
+function _simpleType(t) {
+  return String(t || '').replace(/@[\w.]+(\([^)]*\))?\s*/g, '').replace(/<.*>/, '').split('.').pop();
+}
+function nodeLink(id) {
+  return id[0] === 'T' ? `<a class="go" data-t="${id}">${esc(nodeName(id))}</a>` : `<a class="go" data-m="${id}">${esc(nodeName(id))}</a>`;
+}
+function entryKind(id) {
+  if (id[0] === 'T') return 'field initializer';
+  const m = ME[id]; if (!m) return '';
+  const a = m.a || [];
+  if (m.test) return 'test';
+  const ep = a.find(x => ENDPOINT_ANNOS.has(x)); if (ep) return 'web endpoint @' + ep;
+  const fw = a.find(x => FRAMEWORK_ANNOS.has(x)); if (fw) return 'framework @' + fw;
+  if (m.n === 'main' && ((m.m || []).includes('static') || m._t.implicit)) return 'main()';
+  if (m.k === 'init') return 'initializer';
+  if (a.includes('Override')) return 'override (may be called by a library)';
+  return 'no caller in this repo';
+}
+function allCallers(start) {
+  const dist = new Map([[start, 0]]), via = new Map(), queue = [start];
+  let capped = false;
+  for (let qi = 0; qi < queue.length && !capped; qi++) {
+    const cur = queue[qi], d = dist.get(cur);
+    if (d >= MAX_STEPS) { if (callersOf(cur).some(c => !dist.has(c))) capped = true; continue; }
+    for (const c of callersOf(cur)) {
+      if (dist.has(c)) continue;
+      dist.set(c, d + 1); via.set(c, cur); queue.push(c);
+      if (dist.size > MAX_CALLERS) { capped = true; break; }
+    }
+  }
+  dist.delete(start);
+  const rows = [...dist.entries()].map(([id, d]) => ({id, d, entry: callersOf(id).length === 0}));
+  rows.sort((a, b) => a.d - b.d || (b.entry - a.entry) || nodeName(a.id).localeCompare(nodeName(b.id)));
+  const path = id => {            // caller ... up to (not including) the selected method
+    const p = [id];
+    while (via.has(p[p.length - 1])) p.push(via.get(p[p.length - 1]));
+    return p.slice(0, -1);
+  };
+  return {rows, capped, path};
+}
+function allCallersSection(m) {
+  const res = allCallers(m.id), rows = res.rows, entries = rows.filter(r => r.entry);
+  const maxD = rows.length ? rows[rows.length - 1].d : 0;
+  let h = `<h4>All callers — direct &amp; indirect (${rows.length}${res.capped ? '+' : ''}) <span style="text-transform:none;letter-spacing:0;font-weight:400">— ${entries.length} entry point${entries.length === 1 ? '' : 's'}${rows.length ? ' · up to ' + maxD + ' step' + (maxD === 1 ? '' : 's') + ' away' : ''}</span></h4>`;
+  if (!rows.length) {
+    return h + `<p class="muted">Nothing in this repo reaches this ${m.k === 'ctor' ? 'constructor' : 'method'}${m.k === 'method' ? ' — it is itself an entry point (' + esc(entryKind(m.id)) + ')' : ''}.</p>`;
+  }
+  const rowHTML = r => {
+    const p = res.path(r.id).map(nodeName);
+    return `<tr class="${r.entry ? 'entry' : 'mid'}"><td style="width:52px"><span class="steps" title="${r.d} step${r.d === 1 ? '' : 's'} before the call">${r.d}</span></td><td>${nodeLink(r.id)}`
+      + (r.id[0] === 'M' && ME[r.id].test ? ' <span class="chip test">test</span>' : '')
+      + (r.entry ? ` <span class="chip ep" title="Nothing in this repo calls this — the chain starts here">entry point · ${esc(entryKind(r.id))}</span>` : '')
+      + `<div class="callsig path mono" title="call path">${p.map(esc).join(' → ')} → <b>${esc(nodeName(m.id))}</b></div></td></tr>`;
+  };
+  const LIMIT = 300;
+  h += `<label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-bottom:4px"><input type="checkbox" class="onlyEntry"> only entry points</label>`;
+  h += `<table class="callerTable"><tr><th>Steps</th><th>Caller (and call path)</th></tr>${rows.slice(0, LIMIT).map(rowHTML).join('')}</table>`;
+  if (rows.length > LIMIT) h += `<div class="more"><button class="btn moreCallers">Show all ${fmtN(rows.length)} callers</button></div>`;
+  if (res.capped) h += `<p class="muted">Stopped after ${MAX_STEPS} steps or ${fmtN(MAX_CALLERS)} callers.</p>`;
+  h += `<p class="muted" style="font-size:11.5px">Steps = how many calls happen before this one. 1 = calls it directly. Calls through an interface count every implementation, so some paths are “possible” rather than certain.</p>`;
+  ALL_CALLER_ROWS = {rows, rowHTML};
+  return h;
+}
+let ALL_CALLER_ROWS = null;
+function wireCallerToggles() {
+  P.querySelectorAll('.onlyEntry').forEach(cb => cb.onchange = () => P.querySelector('.callerTable').classList.toggle('only-entry', cb.checked));
+  const more = P.querySelector('.moreCallers');
+  if (more) more.onclick = () => {
+    const tb = P.querySelector('.callerTable');
+    tb.insertAdjacentHTML('beforeend', ALL_CALLER_ROWS.rows.slice(300).map(ALL_CALLER_ROWS.rowHTML).join(''));
+    more.parentElement.remove();
+  };
 }
 function isUnusedPrivate(m) {
   return m.k === 'method' && (m.m || []).includes('private') && !m.test && !(m.a && m.a.length)
@@ -2789,8 +2887,10 @@ function showMethod(id) {
       : m.k === 'init' ? 'Runs automatically when the class is loaded / created.'
       : (m.m || []).includes('private') ? '⚠ Never called — this private method looks unused.'
       : 'Not called anywhere in the scanned code (it may be called by a framework, by reflection, or by code outside this repo).')}
+    ${m.k !== 'init' ? allCallersSection(m) : ''}
     ${tests}`;
   wireCallToggles();
+  wireCallerToggles();
 }
 function showType(id) {
   const t = TY[id]; if (!t) return;
@@ -2832,7 +2932,8 @@ function introPanel() {
   P.innerHTML = `<h3>How to read this report</h3>
   <p class="muted"><b>Structure</b>: expand folders → files → classes → methods. Each method shows <span class="tag in">IN</span> parameter types (objects) and names, and <span class="tag out">OUT</span> the return type.</p>
   <p class="muted">Visibility: <span class="vis pub mono">+</span> public · <span class="vis prot mono">#</span> protected · <span class="vis pkg mono">~</span> package · <span class="vis priv mono">−</span> private.</p>
-  <p class="muted"><b>Expand functions</b> opens folders, files and classes so every function is visible (field lists stay closed). <b>Expand all</b> also opens the field lists; <b>Collapse all</b> closes everything.</p>
+  <p class="muted"><b>Expand functions</b> opens folders, files and classes so every function is visible — field lists, test files and test classes stay closed. <b>Expand all</b> also opens the field lists; <b>Collapse all</b> closes everything.</p>
+  <p class="muted"><b>All callers</b> lists every function that leads to the selected one — directly or through other functions — with the <b>number of steps</b> before the call and the call path. <b>Entry points</b> (tests, web endpoints, main, scheduled jobs, or functions nothing else calls) are highlighted.</p>
   <p class="muted">Click a method to see <b>Calls</b> (every function it calls, in order, with line numbers — calls into this repo are clickable, library/JDK calls are grey) and <b>Called by</b> (every function that calls it). On each row, <span class="cc">→3 ←2</span> means 3 calls into this repo and called by 2.</p>
   <p class="muted"> The coloured labels (ƒ function, const, static, enum, class…) and the colours of data types are explained above the tree.</p>
   <p class="muted">Click any class, method or file to see details here. Switch <b>Folders / Packages</b> at the top of the Structure tab.</p>
@@ -2872,7 +2973,7 @@ const RENDERED = {};
 function showTab(name) {
   document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x.id === 't-' + name));
-  if (!RENDERED[name]) { RENDERED[name] = true; ({overview: renderOverview, structure: renderTree, tests: renderTests, patterns: renderPatterns, odd: renderOdd})[name](); }
+  if (!RENDERED[name]) { RENDERED[name] = true; ({overview: renderOverview, structure: renderTree, odd: renderOdd})[name](); }
 }
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => { showTab(b.dataset.tab); $('#left').scrollTop = 0; });
 function syncSeg() { document.querySelectorAll('#viewseg button').forEach(b => b.classList.toggle('on', b.dataset.view === VIEW)); }
@@ -2887,14 +2988,16 @@ function expandTree(onlyFunctions) {
   if (total > 40000 && !confirm('This repo has ' + fmtN(total) + ' methods. Expanding may take a while. Continue?')) return;
   const btns = [$('#expand'), $('#expandFn')];
   btns.forEach(b => b.disabled = true); btn.textContent = 'Expanding…';
-  const sel = onlyFunctions ? 'details:not([open]):not(.fields)' : 'details:not([open])';
+  // "Expand functions" skips field lists, test files and test classes (and closes them if open)
+  const SKIP = 'details.fields, details.testfile, details.testclass';
+  const sel = onlyFunctions ? 'details:not([open]):not(.fields):not(.testfile):not(.testclass)' : 'details:not([open])';
   const done = () => { btns.forEach(b => b.disabled = false); btn.textContent = label; };
   (function step() {
-    if (onlyFunctions) tree.querySelectorAll('details.fields[open]').forEach(d => d.open = false);
+    if (onlyFunctions) tree.querySelectorAll(SKIP).forEach(d => { if (d.open) d.open = false; });
     const closed = tree.querySelectorAll(sel);
     let n = 0;
     for (const d of closed) { if (d.closest('.hide')) continue; openD(d); if (++n >= 500) break; }
-    if (!n) { if (onlyFunctions) tree.querySelectorAll('details.fields[open]').forEach(d => d.open = false); return done(); }
+    if (!n) { if (onlyFunctions) tree.querySelectorAll(SKIP).forEach(d => { if (d.open) d.open = false; }); return done(); }
     requestAnimationFrame(step);
   })();
 }
@@ -2951,87 +3054,6 @@ function renderOverview() {
     </table>`;
 }
 
-/* ---------------- tests ---------------- */
-function renderTests() {
-  const ct = M.coverage_total || {}, ls = M.link_stats || {};
-  const rows = D.coverage.slice();
-  let sortMode = 'name';
-  const el = $('#t-tests');
-  const testClasses = Object.values(TY).filter(t => t.test).length;
-  el.innerHTML = `
-    <div class="cards">
-      ${card(fmtN(M.test_java), 'test files')}${card(fmtN(testClasses), 'test classes')}${card(fmtN(M.test_methods), 'test methods')}
-      ${card(fmtN(ls.test_methods_linked || 0), 'test methods linked to code')}
-      ${card(pct(ct.with_test || 0, ct.classes) + '%', 'classes with a test (' + fmtN(ct.with_test || 0) + '/' + fmtN(ct.classes || 0) + ')')}
-      ${card(pct(ct.tested || 0, ct.methods) + '%', 'non-private methods directly tested (' + fmtN(ct.tested || 0) + '/' + fmtN(ct.methods || 0) + ')')}
-    </div>
-    <div class="legend"><b>How tests are linked</b> — Technique 1 (name): <code>OrderServiceTest</code> → <code>OrderService</code>. Technique 3 (calls): inside each test method, calls on the object under test (fields, <code>@InjectMocks</code>, <code>@Autowired</code>, <code>new X()</code>, locals) are matched to methods by name + argument count; calls on mocks are ignored.<br>
-    <span class="chip ok">strong</span> = called directly by a test in the matching test class (1 + 3) · <span class="chip">call</span> = called directly by another test class (3 only).
-    Methods only reached indirectly (e.g. private helpers) count as not directly tested.</div>
-    <h2>Coverage by package <span class="muted" style="font-weight:400">— sort: <a class="go" id="sName">name</a> · <a class="go" id="sLow">lowest first</a></span></h2>
-    <div id="covTable"></div>
-    <h2>Methods with no direct test <span class="muted" style="font-weight:400">(non-private, with a body)</span></h2>
-    <div class="toolbar" style="position:static"><input id="uq" placeholder="Filter by class, method or package…"></div>
-    <div id="untested"></div>`;
-  function drawCov() {
-    const rs = rows.slice();
-    if (sortMode === 'low') rs.sort((a, b) => pct(a.tested || 0, a.methods) - pct(b.tested || 0, b.methods));
-    $('#covTable').innerHTML = '<table class="grid"><tr><th>Package</th><th>Classes</th><th>With test</th><th>Methods</th><th>Directly tested</th><th>Strong</th><th style="width:220px">%</th></tr>' +
-      rs.map(r => { const p = pct(r.tested || 0, r.methods); return `<tr><td class="mono" style="font-size:12px">${esc(r.p)}</td><td>${r.classes || 0}</td><td>${r.with_test || 0}</td><td>${r.methods || 0}</td><td>${r.tested || 0}</td><td>${r.strong || 0}</td><td><div class="barwrap"><div class="bg"><div class="bar ${p >= 60 ? 'g' : p < 25 ? 'o' : ''}" style="width:${p}%"></div></div><span class="muted">${p}%</span></div></td></tr>`; }).join('') + '</table>';
-  }
-  drawCov();
-  $('#sName').onclick = () => { sortMode = 'name'; drawCov(); };
-  $('#sLow').onclick = () => { sortMode = 'low'; drawCov(); };
-  let limit = 300;
-  function drawUntested() {
-    const q = ($('#uq').value || '').toLowerCase();
-    const ids = D.untested.filter(id => { const m = ME[id]; if (!m) return false; return !q || (m._t.q + '.' + m.n + ' ' + (m._t._f.pkg || '')).toLowerCase().includes(q); });
-    $('#untested').innerHTML = '<table class="grid"><tr><th>Method</th><th><span class="tag in">IN</span></th><th><span class="tag out">OUT</span></th><th>Class has test class?</th></tr>' +
-      ids.slice(0, limit).map(id => { const m = ME[id]; return `<tr><td>${mLink(id)}</td><td class="mono" style="font-size:11.5px">${paramsHTML(m)}</td><td class="mono" style="font-size:11.5px">${outHTML(m)}</td><td>${m._t.tc && m._t.tc.length ? '<span class="chip ok">yes</span>' : '<span class="chip">no</span>'}</td></tr>`; }).join('') + '</table>' +
-      (ids.length > limit ? `<div class="more"><button class="btn" id="moreU">Show more (${fmtN(ids.length - limit)} remaining)</button></div>` : '') +
-      (D.untested.length >= 5000 ? '<p class="muted">List capped at 5,000 methods in this report.</p>' : '');
-    const b = $('#moreU'); if (b) b.onclick = () => { limit += 500; drawUntested(); };
-  }
-  $('#uq').oninput = () => { limit = 300; drawUntested(); };
-  drawUntested();
-}
-
-/* ---------------- patterns ---------------- */
-function renderPatterns() {
-  const styleTot = {};
-  D.folders.forEach(r => Object.entries(r.styles).forEach(([k, v]) => styleTot[k] = (styleTot[k] || 0) + v));
-  const el = $('#t-patterns');
-  el.innerHTML = `
-    <div class="legend">Organisation: <b>${esc(M.organisation)}</b> · Layout source roots: ${Object.keys(M.source_roots).slice(0, 6).map(esc).join(', ') || '—'}</div>
-    <h2>File naming styles (all files)</h2>${bars(styleTot, M.files)}
-    <h2>Folders <span class="muted" style="font-weight:400">— which files are in which folder, and their naming pattern</span></h2>
-    <div class="toolbar" style="position:static"><input id="fq" placeholder="Filter folders…"></div>
-    <div id="ftable"></div>
-    <h2>Java packages <span class="muted" style="font-weight:400">— role of the classes in each package (by class-name suffix)</span></h2>
-    <div class="toolbar" style="position:static"><input id="pq" placeholder="Filter packages…"></div>
-    <div id="ptable"></div>`;
-  let fl = 400, pl = 400;
-  function drawF() {
-    const q = ($('#fq').value || '').toLowerCase();
-    const rs = D.folders.filter(r => !q || r.d.toLowerCase().includes(q));
-    $('#ftable').innerHTML = '<table class="grid"><tr><th>Folder</th><th>Files</th><th>Main naming style</th><th>Consistency</th><th>Extensions</th><th>Java roles</th></tr>' +
-      rs.slice(0, fl).map(r => `<tr><td class="mono" style="font-size:12px"><a class="go fold" data-d="${esc(r.d)}">${esc(r.d)}</a></td><td>${r.n}</td><td>${esc(r.style)}</td><td><span class="chip ${r.cons < 60 && r.n >= 4 ? 'warn' : ''}">${r.cons}%</span></td><td class="muted">${Object.entries(r.ext).map(([k, v]) => esc(k) + ' ' + v).join(', ')}</td><td class="muted">${Object.entries(r.roles).map(([k, v]) => '*' + esc(k) + ' ' + v).join(', ')}</td></tr>`).join('') + '</table>' +
-      (rs.length > fl ? `<div class="more"><button class="btn" id="moreF">Show more (${fmtN(rs.length - fl)})</button></div>` : '');
-    const b = $('#moreF'); if (b) b.onclick = () => { fl += 500; drawF(); };
-    document.querySelectorAll('a.fold').forEach(a => a.onclick = () => revealFolder(a.dataset.d));
-  }
-  function drawP() {
-    const q = ($('#pq').value || '').toLowerCase();
-    const rs = D.packages.filter(r => !q || r.p.toLowerCase().includes(q));
-    $('#ptable').innerHTML = '<table class="grid"><tr><th>Package</th><th>Files</th><th>Types</th><th>Kinds</th><th>Main role</th><th>Roles</th></tr>' +
-      rs.slice(0, pl).map(r => `<tr><td class="mono" style="font-size:12px">${esc(r.p)}${r.test ? ' <span class="chip test">' + r.test + ' test</span>' : ''}</td><td>${r.files}</td><td>${r.types}</td><td class="muted">${Object.entries(r.kinds).map(([k, v]) => esc(k) + ' ' + v).join(', ')}</td><td>${r.main_role ? '*' + esc(r.main_role) : '—'}</td><td class="muted">${Object.entries(r.roles).map(([k, v]) => '*' + esc(k) + ' ' + v).join(', ')}</td></tr>`).join('') + '</table>' +
-      (rs.length > pl ? `<div class="more"><button class="btn" id="moreP">Show more (${fmtN(rs.length - pl)})</button></div>` : '');
-    const b = $('#moreP'); if (b) b.onclick = () => { pl += 500; drawP(); };
-  }
-  $('#fq').oninput = () => { fl = 400; drawF(); };
-  $('#pq').oninput = () => { pl = 400; drawP(); };
-  drawF(); drawP();
-}
 function revealFolder(d) {
   const f = D.files.find(x => (x.p.includes('/') ? x.p.slice(0, x.p.lastIndexOf('/')) : '(root)') === d);
   if (f) { if (VIEW !== 'folder') { VIEW = 'folder'; syncSeg(); RENDERED.structure = false; } reveal(f.p); }

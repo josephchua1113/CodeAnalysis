@@ -167,6 +167,7 @@ public class CallSamples extends BaseSamples {
     private void unusedHelper() { unusedHelper(); }
     private int initialCount() { return 0; }
     private static void log(String m) {}
+    void ping(int n) { pong(n); } void pong(int n) { ping(n - 1); }
     class Inner { void go() { helper(null); repo.save(null); } }
 }
 class BaseSamples { protected void inherited() {} }
@@ -343,6 +344,13 @@ class AnalyzerTests(unittest.TestCase):
               (nparams is None or len(m.get("p", [])) == nparams)]
         self.assertTrue(ms, "method %s.%s not found" % (q, name))
         return ms[0]
+
+    def is_test_method_file(self, mid):
+        for f in self.data["files"]:
+            for t in walk(f.get("types", [])):
+                if any(m["id"] == mid for m in t.get("fn", [])):
+                    return bool(f.get("test"))
+        return False
 
     def mid(self, q, name, nparams=None):
         return self.M(q, name, nparams)["id"]
@@ -615,6 +623,18 @@ class AnalyzerTests(unittest.TestCase):
         payload = re.search(r'<script id="data" type="application/json">(.*?)</script>', html, re.S).group(1)
         self.assertEqual(json.loads(payload)["meta"]["files"], len(self.files))
 
+    def test_tests_and_patterns_tabs_removed(self):
+        with open(self.report, encoding="utf-8") as fh:
+            html = fh.read()
+        self.assertNotIn('data-tab="tests"', html)
+        self.assertNotIn('data-tab="patterns"', html)
+        self.assertNotIn("renderTests", html)
+        self.assertNotIn("renderPatterns", html)
+        payload = json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>', html, re.S).group(1))
+        for key in ("coverage", "untested", "folders", "packages"):
+            self.assertNotIn(key, payload)          # only used by the removed tabs
+            self.assertIn(key, self.data)           # still available in structure.json
+
     def test_report_javascript_syntax(self):
         node = shutil.which("node")
         if not node:
@@ -735,9 +755,24 @@ class AnalyzerTests(unittest.TestCase):
             pg.click("#expandFn")
             pg.wait_for_function("!document.querySelector('#expandFn').disabled")
             self.assertEqual(pg.inner_text("#expandFn"), "Expand functions")
-            self.assertEqual(pg.locator("#tree .m[data-m]").count(), len(self.methods))
+            non_test = [m["id"] for t, m in self.methods.values() if not t.get("test") and not self.is_test_method_file(m["id"])]
+            shown = pg.eval_on_selector_all("#tree .m[data-m]", "els => els.map(e => e.dataset.m)")
+            self.assertEqual(sorted(shown), sorted(non_test))                          # every non-test function
+            test_ids = [m["id"] for t, m in self.methods.values() if m.get("test")]
+            self.assertTrue(test_ids)
+            self.assertFalse(set(test_ids) & set(shown))                             # no test functions
             self.assertEqual(pg.locator("#tree details.fields[open]").count(), 0)
-            self.assertEqual(pg.locator("#tree details:not(.fields):not([open])").count(), 0)
+            self.assertEqual(pg.locator("#tree details.testfile[open], #tree details.testclass[open]").count(), 0)
+            self.assertEqual(pg.locator("#tree details.testfile").count(), 3)          # test files still listed
+            self.assertEqual(pg.locator("#tree details:not(.fields):not(.testfile):not(.testclass):not([open])").count(), 0)
+            # after Expand all, Expand functions closes the test files again
+            pg.click("#expand")
+            pg.wait_for_function("!document.querySelector('#expand').disabled")
+            self.assertGreater(pg.locator("#tree details.testfile[open]").count(), 0)
+            pg.click("#expandFn")
+            pg.wait_for_function("!document.querySelector('#expandFn').disabled")
+            self.assertEqual(pg.locator("#tree details.testfile[open], #tree details.testclass[open]").count(), 0)
+            self.assertEqual(pg.locator("#tree details.fields[open]").count(), 0)
             # ---- calls / called by in the panel
             run_id = self.mid("CallSamples", "run")
             pg.locator(".m[data-m=%s]" % run_id).click()
@@ -763,6 +798,90 @@ class AnalyzerTests(unittest.TestCase):
             pg.click("#expand")
             pg.wait_for_function("!document.querySelector('#expand').disabled")
             self.assertEqual(pg.locator("#tree details:not([open])").count(), 0)
+            b.close()
+        self.assertEqual(errors, [])
+
+    def _py_all_callers(self, start):
+        """Independent breadth-first search over the 'called by' data (same rules as the report)."""
+        by_id = {m["id"]: (t, m) for t, m in self.methods.values()}
+        types = {t["id"]: t for t in self.types.values()}
+        for f in self.data["files"]:
+            for t in walk(f.get("types", [])):
+                types[t["id"]] = t
+        def callers(i):
+            if i[0] == "T":
+                return sorted({c for m in types[i].get("fn", []) if m["k"] == "ctor" for c in m.get("cb", [])})
+            return [c for c in by_id[i][1].get("cb", []) if c != i]
+        dist, queue = {start: 0}, [start]
+        for cur in queue:
+            for c in callers(cur):
+                if c not in dist:
+                    dist[c] = dist[cur] + 1
+                    queue.append(c)
+        del dist[start]
+        return dist, {i for i in dist if not callers(i)}
+
+    def test_report_all_callers_with_steps(self):
+        sync_playwright = self._browser()
+        errors = []
+        target = self.mid("JpaOrderRepository", "save")
+        dist, entries = self._py_all_callers(target)
+        mid = self.mid
+        # expected chain:  OrderController.create -> placeOrder(User) -> placeOrder(User, items) -> repo.save
+        self.assertEqual(dist[mid("OrderService", "placeOrder", 2)], 1)
+        self.assertEqual(dist[mid("OrderService", "placeOrder", 1)], 2)
+        self.assertEqual(dist[mid("OrderController", "create")], 3)
+        self.assertEqual(dist[mid("OrderServiceTest", "placeOrder_savesOrder")], 1)   # calls repository.save itself
+        self.assertEqual(dist[mid("OrderServiceTest", "rejectsUnknown")] if mid("OrderServiceTest", "rejectsUnknown") in dist else None, None)
+        self.assertIn(mid("OrderController", "create"), entries)
+        with sync_playwright() as p:
+            exe = shutil.which("google-chrome") or shutil.which("chromium") or None
+            try:
+                b = p.chromium.launch(executable_path=exe, args=["--no-sandbox"]) if exe else p.chromium.launch()
+            except Exception as e:  # noqa
+                self.skipTest("no browser available: %s" % e)
+            pg = b.new_page(viewport={"width": 1400, "height": 900})
+            pg.on("pageerror", lambda e: errors.append(str(e)))
+            pg.goto("file://" + os.path.abspath(self.report).replace("\\", "/"))
+            # report's own search gives exactly the same steps and entry points
+            js = pg.evaluate("id => allCallers(id).rows.map(r => [r.id, r.d, r.entry])", target)
+            self.assertEqual({r[0]: r[1] for r in js}, dist)
+            self.assertEqual({r[0] for r in js if r[2]}, entries)
+            self.assertEqual(pg.evaluate("id => entryKind(id)", mid("OrderController", "create")), "web endpoint @PostMapping")
+            self.assertEqual(pg.evaluate("id => entryKind(id)", mid("OrderServiceTest", "placeOrder_savesOrder")), "test")
+            path = pg.evaluate("id => { const r = allCallers(id); return r.path(%r).map(nodeName); }" % mid("OrderController", "create"), target)
+            self.assertEqual(path, ["OrderController.create", "OrderService.placeOrder(User)",
+                                    "OrderService.placeOrder(User, List)"])          # overloads told apart
+            # cycles terminate: ping <-> pong
+            self.assertEqual(pg.evaluate("id => allCallers(id).rows.map(r => [nodeName(r.id), r.d])", mid("CallSamples", "ping")),
+                             [["CallSamples.pong", 1]])
+            # field initializer as a caller, continuing to the callers of the constructor
+            init_rows = pg.evaluate("id => allCallers(id).rows.map(r => nodeName(r.id))", mid("CallSamples", "initialCount"))
+            self.assertEqual(init_rows, ["CallSamples (field initializer)"])
+            # ---- panel UI
+            pg.click("#tabs button[data-tab=structure]")
+            pg.fill("#q", "JpaOrderRepository")
+            pg.wait_for_timeout(400)
+            pg.locator("#results .row[data-m=%s]" % target).click()
+            pg.wait_for_timeout(300)
+            panel = pg.inner_text("#panel")
+            self.assertIn("ALL CALLERS", panel.upper())
+            rows = pg.locator("#panel .callerTable tr.entry, #panel .callerTable tr.mid")
+            self.assertEqual(rows.count(), len(dist))
+            first_steps = pg.locator("#panel .callerTable .steps").all_inner_texts()
+            self.assertEqual(first_steps, sorted(first_steps, key=int))
+            create_row = pg.locator("#panel .callerTable tr", has_text="OrderController.create").first
+            self.assertEqual(create_row.locator(".steps").inner_text(), "3")
+            self.assertIn("entry point", create_row.inner_text())
+            self.assertIn("OrderController.create → OrderService.placeOrder(User) → OrderService.placeOrder(User, List) → JpaOrderRepository.save",
+                          create_row.inner_text())
+            pg.check("#panel .onlyEntry")
+            self.assertEqual(pg.locator("#panel .callerTable tr.mid").first.is_visible(), False)
+            self.assertTrue(create_row.is_visible())
+            # a method nobody calls is itself an entry point
+            pg.locator("#panel a.go[data-m=%s]" % mid("OrderController", "create")).first.click()
+            pg.wait_for_timeout(200)
+            self.assertIn("itself an entry point (web endpoint @PostMapping)", pg.inner_text("#panel"))
             b.close()
         self.assertEqual(errors, [])
 
@@ -844,7 +963,9 @@ class AnalyzerTests(unittest.TestCase):
             pg.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
             pg.on("request", lambda r: errors.append("NETWORK " + r.url) if not r.url.startswith(("file:", "data:")) else None)
             pg.goto("file://" + os.path.abspath(self.report).replace("\\", "/"))
-            for tab in ("structure", "tests", "patterns", "odd", "overview", "structure"):
+            self.assertEqual(pg.locator("#tabs button").all_inner_texts(), ["Overview", "Structure", "Odd ones out"])
+            self.assertEqual(pg.locator("#t-tests, #t-patterns").count(), 0)
+            for tab in ("structure", "odd", "overview", "structure"):
                 pg.click("#tabs button[data-tab=%s]" % tab)
                 pg.wait_for_timeout(100)
             pg.fill("#q", "placeOrder")
@@ -859,8 +980,10 @@ class AnalyzerTests(unittest.TestCase):
             pg.locator("#tree details summary").first.click()
             pg.click("#tabs button[data-tab=odd]")
             pg.locator("[data-oi]").first.click()
-            pg.click("#tabs button[data-tab=tests]")
-            pg.locator("#untested a.go").first.click()
+            pg.click("#tabs button[data-tab=structure]")
+            pg.click("#expandFn")
+            pg.wait_for_function("!document.querySelector('#expandFn').disabled")
+            self.assertGreater(pg.locator("#tree .chip.ok", has_text="tested").count(), 0)   # test badges still shown
             pg.click("#tabs button[data-tab=overview]")
             self.assertIn("weirdext", pg.inner_text("#t-overview"))
             b.close()
