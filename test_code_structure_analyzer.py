@@ -134,6 +134,43 @@ public record Order(String id, User user, OrderStatus status) implements java.io
     public static Order empty() { return new Order("0"); }
 }
 ''',
+    B + "order/JpaOrderRepository.java": """package com.acme.shop.order;
+import java.util.*;
+public class JpaOrderRepository implements OrderRepository {
+    public Order save(Order o) { return o; }
+    public Optional<Order> findById(String id) { return Optional.empty(); }
+    public List<Order> findAll() { return new ArrayList<>(); }
+}
+""",
+    B + "order/CallSamples.java": """package com.acme.shop.order;
+import java.util.*;
+import static com.acme.shop.order.OrderStatus.fromCode;
+public class CallSamples extends BaseSamples {
+    private final OrderRepository repo;
+    private final List<String> names = new ArrayList<>();
+    private final int start = initialCount();
+    public CallSamples(OrderRepository repo) { super(); this.repo = repo; }
+    public String run(String id) {
+        Order o = repo.findById(id).orElse(null);
+        names.add(id);
+        helper(o);
+        inherited();
+        OrderStatus s = fromCode("n");
+        new User().getName();
+        Runnable r = () -> log(id);
+        mystery.call();
+        System.out.println(o.status());
+        this.repo.findAll();
+        return id.trim();
+    }
+    private void helper(Order o) { log("x"); }
+    private void unusedHelper() { unusedHelper(); }
+    private int initialCount() { return 0; }
+    private static void log(String m) {}
+    class Inner { void go() { helper(null); repo.save(null); } }
+}
+class BaseSamples { protected void inherited() {} }
+""",
     B + "order/User.java": "package com.acme.shop.order;\npublic class User { private String name; public String getName() { return name; } }\n",
     B + "order/OrderItem.java": "package com.acme.shop.order;\npublic class OrderItem { }\n",
     B + "order/OrderStatus.java": '''package com.acme.shop.order;
@@ -600,6 +637,134 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(ts["Color"]["k"], "enum")
         self.assertEqual(ts["MAX_ROWS"]["k"], "const")
         self.assertEqual(ts["MAX_ROWS"]["r"], "number")
+
+    # ---------- A: calls inside each function,  B: called by
+    def calls(self, q, name, nparams=None):
+        return {c[1]: c for c in self.M(q, name, nparams).get("cl", [])}
+
+    def test_calls_resolved_inside_function(self):
+        c = self.calls("CallSamples", "run")
+        mid = self.mid
+        self.assertEqual(c["OrderRepository.findById"][2:4], ["i", [mid("OrderRepository", "findById")]])
+        self.assertEqual(c["OrderRepository.findById"][4], [mid("JpaOrderRepository", "findById")])  # implementation
+        self.assertEqual(c["OrderRepository.findById"][0], 10)                                        # line number
+        self.assertEqual(c["Optional.orElse"][2], "x")                                    # chained, library
+        self.assertEqual(c["List.add"][2], "x")                                           # field of library type
+        self.assertEqual(c["CallSamples.helper"][3], [mid("CallSamples", "helper")])      # own private method
+        self.assertEqual(c["BaseSamples.inherited"][3], [mid("BaseSamples", "inherited")])  # inherited
+        self.assertEqual(c["OrderStatus.fromCode"][3], [mid("OrderStatus", "fromCode")])  # static import
+        self.assertEqual(c["User.getName"][3], [mid("User", "getName")])                  # new User().getName()
+        self.assertEqual(c["CallSamples.log"][3], [mid("CallSamples", "log")])            # inside a lambda
+        self.assertEqual(c["mystery.call"][2], "u")                                       # unknown receiver
+        self.assertEqual(c["System.out.println"][2], "x")
+        self.assertEqual(c["Order.status() (record accessor)"][2], "x")
+        self.assertEqual(c["OrderRepository.findAll"][3], [mid("OrderRepository", "findAll")])  # this.repo
+        self.assertEqual(c["String.trim"][2], "x")                                        # parameter type
+        self.assertEqual(c["new User"][3], [self.T("User")["id"]])                         # default constructor
+        lines = [x[0] for x in self.M("CallSamples", "run")["cl"]]
+        self.assertEqual(lines, sorted(lines))                                            # in source order
+
+    def test_calls_constructors_and_delegation(self):
+        c = self.calls("OrderService", "placeOrder", 2)
+        ctor3 = [m for m in self.T("Order")["fn"] if m["k"] == "ctor" and len(m.get("p", [])) == 3][0]
+        self.assertEqual(c["new Order"][3], [ctor3["id"]])
+        self.assertEqual(c["OrderRepository.save"][4], [self.mid("JpaOrderRepository", "save")])
+        one_arg = [m for m in self.T("Order")["fn"] if m["k"] == "ctor" and len(m.get("p", [])) == 1][0]
+        self.assertEqual([x[3] for x in one_arg["cl"] if x[1].startswith("new Order (this")], [[ctor3["id"]]])
+        sup = {x[1]: x for x in [m for m in self.T("CallSamples")["fn"] if m["k"] == "ctor"][0]["cl"]}
+        self.assertIn("new BaseSamples (super(…))", sup)
+
+    def test_calls_java21_patterns_and_enum_builtins(self):
+        c = self.calls("Shape", "area")
+        self.assertEqual(c["Circle.r() (record accessor)"][2], "x")      # case Circle c -> c.r()
+        self.assertNotIn("Square", c)                                     # record pattern is not a call
+        self.assertFalse([x for x in self.M("Shape", "area")["cl"] if x[2] == "u"])
+        e = self.calls("OrderStatus", "fromCode")
+        self.assertEqual(e["OrderStatus.values (enum built-in)"][2], "x")
+
+    def test_calls_from_inner_class_and_overloads(self):
+        c = self.calls("CallSamples.Inner", "go")
+        self.assertEqual(c["CallSamples.helper"][3], [self.mid("CallSamples", "helper")])   # outer method
+        self.assertEqual(c["OrderRepository.save"][3], [self.mid("OrderRepository", "save")])  # outer field
+        c1 = self.calls("OrderService", "placeOrder", 1)
+        self.assertEqual(c1["OrderService.placeOrder"][3], [self.mid("OrderService", "placeOrder", 2)])
+
+    def test_called_by(self):
+        cb = lambda q, n, k=None: set(self.M(q, n, k).get("cb", []))
+        mid = self.mid
+        self.assertEqual(cb("CallSamples", "helper"), {mid("CallSamples", "run"), mid("CallSamples.Inner", "go")})
+        self.assertIn(mid("OrderService", "placeOrder", 2), cb("JpaOrderRepository", "save"))   # via interface
+        self.assertIn(mid("CallSamples.Inner", "go"), cb("JpaOrderRepository", "save"))
+        callers = cb("OrderService", "placeOrder", 2)
+        self.assertIn(mid("OrderService", "placeOrder", 1), callers)
+        self.assertIn(mid("OrderServiceTest", "placeOrder_savesOrder"), callers)             # tests count too
+        self.assertIn(mid("OrderController", "create"), cb("OrderService", "placeOrder", 1))
+        self.assertIn(self.T("CallSamples")["id"], cb("CallSamples", "initialCount"))        # field initializer
+        self.assertEqual(cb("OrderService", "max"), set())
+
+    def test_unused_private_methods(self):
+        msgs = [a["msg"] for a in self.data["anomalies"] if a["cat"] == "Unused private method"]
+        self.assertIn("CallSamples.unusedHelper is private and never called", msgs)       # self-recursion only
+        self.assertFalse(any("CallSamples.helper " in x for x in msgs))
+        self.assertFalse(any("initialCount" in x for x in msgs))                           # used by a field
+        self.assertFalse(any("checkFind" in x for x in msgs))                              # used by a test
+
+    def test_call_stats_and_raw_data_removed(self):
+        cs = self.data["meta"]["call_stats"]
+        self.assertGreater(cs["in_repo"], 20)
+        self.assertGreater(cs["library"], 5)
+        for t, m in self.methods.values():
+            for key in ("calls", "loc", "news", "mk"):
+                self.assertNotIn(key, m)
+        self.assertNotIn("fi", self.T("CallSamples"))
+
+    def test_report_calls_panel_and_expand_functions(self):
+        sync_playwright = self._browser()
+        errors = []
+        with sync_playwright() as p:
+            exe = shutil.which("google-chrome") or shutil.which("chromium") or None
+            try:
+                b = p.chromium.launch(executable_path=exe, args=["--no-sandbox"]) if exe else p.chromium.launch()
+            except Exception as e:  # noqa
+                self.skipTest("no browser available: %s" % e)
+            pg = b.new_page(viewport={"width": 1400, "height": 900})
+            pg.on("pageerror", lambda e: errors.append(str(e)))
+            pg.goto("file://" + os.path.abspath(self.report).replace("\\", "/"))
+            pg.click("#tabs button[data-tab=structure]")
+            # ---- expand functions only
+            pg.click("#expandFn")
+            pg.wait_for_function("!document.querySelector('#expandFn').disabled")
+            self.assertEqual(pg.inner_text("#expandFn"), "Expand functions")
+            self.assertEqual(pg.locator("#tree .m[data-m]").count(), len(self.methods))
+            self.assertEqual(pg.locator("#tree details.fields[open]").count(), 0)
+            self.assertEqual(pg.locator("#tree details:not(.fields):not([open])").count(), 0)
+            # ---- calls / called by in the panel
+            run_id = self.mid("CallSamples", "run")
+            pg.locator(".m[data-m=%s]" % run_id).click()
+            panel = pg.inner_text("#panel")
+            self.assertIn("CALLS (", panel.upper())
+            self.assertIn("CALLED BY", panel.upper())
+            self.assertIn("OrderRepository.findById", panel)
+            self.assertIn("implemented by", panel)
+            self.assertIn("? unresolved", panel)
+            n_rows = pg.locator("#panel .callTable tr.call-x").count()
+            self.assertGreater(n_rows, 0)
+            pg.check("#panel .onlyRepo")
+            self.assertFalse(pg.locator("#panel .callTable tr.call-x").first.is_visible())
+            self.assertTrue(pg.locator("#panel .callTable tr.call-i").first.is_visible())
+            self.assertIn("→", pg.locator(".m[data-m=%s] .cc" % run_id).inner_text())
+            pg.locator("#panel a.go[data-m=%s]" % self.mid("CallSamples", "helper")).first.click()
+            pg.wait_for_timeout(200)
+            self.assertIn("CallSamples.helper", pg.inner_text("#panel h3"))
+            self.assertIn("CallSamples.run", pg.inner_text("#panel"))                   # called by
+            pg.locator(".m[data-m=%s]" % self.mid("CallSamples", "unusedHelper")).click()
+            self.assertIn("looks unused", pg.inner_text("#panel"))
+            # ---- expand all still opens the field lists
+            pg.click("#expand")
+            pg.wait_for_function("!document.querySelector('#expand').disabled")
+            self.assertEqual(pg.locator("#tree details:not([open])").count(), 0)
+            b.close()
+        self.assertEqual(errors, [])
 
     def _browser(self):
         try:

@@ -80,7 +80,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Extensions that get a code outline (all other files are still listed and read).
 JAVA_EXTS = ("java",)
@@ -272,6 +272,12 @@ class JavaParser(object):
             return m + 1
         return self.n if self.v[i] == "{" else i + 1
 
+    def field_ctx(self, owner):
+        c = owner.get("_fi")
+        if c is None:
+            c = owner["_fi"] = Ctx()
+        return c
+
     def doc_at(self, i):
         return self.docs.get(i)
 
@@ -360,6 +366,10 @@ class JavaParser(object):
         if implicit is not None:
             implicit["e"] = self.ln[n - 1] if n else 1
         res["recoveries"] = self.recoveries
+        for t in _walk_types(res["types"]):
+            c = t.pop("_fi", None)
+            if c is not None and (c.calls or c.news):
+                t["fi"] = {"calls": c.calls, "news": c.news}
         return res
 
     # ---- modifiers / annotations -----------------------------------------
@@ -544,7 +554,7 @@ class JavaParser(object):
                 i += 1
                 if v[i] == "(":
                     close = self.close_of(i)
-                    self.scan(i + 1, close, Ctx(), owner)
+                    self.scan(i + 1, close, self.field_ctx(owner), owner)
                     i = close + 1
                 if v[i] == "{":
                     body = self.new_type("enum constant", name, owner, line)
@@ -747,7 +757,7 @@ class JavaParser(object):
                 end = self.expr_end(j + 1)
                 if self.is_mock_init(j + 1):
                     f["mock"] = True
-                self.scan(j + 1, end, Ctx(), owner)
+                self.scan(j + 1, end, self.field_ctx(owner), owner)
                 j = end
             owner["f"].append(f)
             if v[j] == ",":
@@ -826,7 +836,10 @@ class JavaParser(object):
         if p < 0:
             return "?"
         if k[p] == ID:
-            return v[p]
+            s = p
+            while s >= 2 and v[s - 1] == "." and k[s - 2] == ID:
+                s -= 2
+            return "".join(v[s:p + 1])
         if v[p] == ")":
             m = self.mt[p]
             if 0 <= m < p:
@@ -873,10 +886,15 @@ class JavaParser(object):
                     ctx.calls.append([self.receiver(i), x, self.count_args(i + 1), ln[i]])
                     i += 1
                     continue
-                if x == "instanceof":
+                if x in ("instanceof", "case"):
                     t, j = self.parse_type(i + 1)
-                    if t and k[j] == ID and v[j] not in NOT_TYPE:
-                        ctx.locals[v[j]] = t
+                    if t and k[j] == ID and v[j] not in NOT_TYPE and v[j] != "when":
+                        ctx.locals[v[j]] = t          # pattern variable: case Circle c / instanceof Circle c
+                        i = j + 1
+                        continue
+                    if t and v[j] == "(" and t[:1].isupper():
+                        i = j + 1                     # record pattern: case Square(double side) - not a call
+                        continue
                     i += 1
                     continue
                 if prev in STMT_START and x not in NOT_TYPE:
@@ -1067,8 +1085,6 @@ def parse_file_task(args):
             res = JavaParser(src, name).parse()
             rec.update(res)
             _mark_tests(rec)
-            if not rec["test"] and not keep_calls:
-                _strip_body_info(rec["types"])
         elif ext in JS_TS_EXTS:
             syms, imps = outline_js(src)
             rec["sym"] = syms
@@ -1417,6 +1433,8 @@ class Linker(object):
             mocks = set(m.get("mk", []))
             for recv, name, argc, _line in m.get("calls", []):
                 entry = None
+                if not recv.startswith("new:") and "." in recv:
+                    recv = recv.rsplit(".", 1)[-1]
                 if recv == "" or recv in ("this", "super"):
                     if name in own:
                         hs.add(name)
@@ -1481,6 +1499,280 @@ class Linker(object):
 
 
 # --------------------------------------------------------------------------- #
+#  Analysis: calls inside each function (A) and "called by" (B)                #
+# --------------------------------------------------------------------------- #
+
+_GENERIC_VAR = re.compile(r"[A-Z][0-9]?")
+
+
+def _simple(t):
+    return _strip_generics(t or "").split(".")[-1]
+
+
+def _id_key(x):
+    return (x[0], int(x[1:]) if x[1:].isdigit() else 0)
+
+
+class CallResolver(Linker):
+    """Works out, for every call inside every method / constructor / initializer,
+    which method in this repo it goes to (kind 'i'), or that it goes to a
+    library / JDK type (kind 'x'), or that the receiver type is unknown ('u').
+    Then builds the reverse lists: who calls each method."""
+
+    ENUM_BUILTINS = {"values", "valueOf", "ordinal", "name", "compareTo", "getDeclaringClass", "describeConstable"}
+    UNUSED_OK = {"readObject", "writeObject", "readResolve", "writeReplace", "readObjectNoData"}
+    MAX_CALLS = 400
+
+    def __init__(self, files):
+        self.files = files
+        self.index = defaultdict(list)          # ALL named types (main + test)
+        self.implementers = defaultdict(list)
+        self.parent, self.methods, self.owner = {}, {}, {}
+        self._cache = {}
+        for f in files:
+            self._walk(f.get("types", []), None, f)
+
+    def _walk(self, types, par, f):
+        for t in types:
+            self.parent[t["id"]] = par
+            if t["k"] not in ("anonymous", "enum constant"):
+                self.index[t["n"]].append((t, f))
+                for sup in t.get("ext", []) + t.get("impl", []):
+                    self.implementers[_simple(sup)].append((t, f))
+            for m in t.get("fn", []):
+                self.methods[m["id"]] = m
+                self.owner[m["id"]] = (t, f)
+            self._walk(t.get("nt", []), t, f)
+
+    def chain(self, t):
+        out = []
+        while t is not None:
+            out.append(t)
+            t = self.parent.get(t["id"])
+        return out
+
+    def _fields_into(self, t, f, vars_, depth):
+        for fl in t.get("f", []):
+            vars_.setdefault(fl["n"], fl["t"])
+        if depth < 4:
+            for sup in t.get("ext", []):
+                e = self.resolve(sup, f)
+                if e and e[0] is not t:
+                    self._fields_into(e[0], e[1], vars_, depth + 1)
+
+    def type_vars(self, t, f):
+        vars_ = {}
+        for ct in self.chain(t):
+            self._fields_into(ct, f, vars_, 0)
+        return vars_
+
+    def field_type(self, entry, name, depth=0):
+        t, f = entry
+        for fl in t.get("f", []):
+            if fl["n"] == name:
+                return fl["t"], f
+        if depth < 4:
+            for sup in t.get("ext", []):
+                e = self.resolve(sup, f)
+                if e and e[0] is not t:
+                    r = self.field_type(e, name, depth + 1)
+                    if r:
+                        return r
+        return None
+
+    @staticmethod
+    def _hit(owner_name, name, hits):
+        return (owner_name + "." + name, "i", [h["id"] for h in hits], hits[0].get("r"))
+
+    def resolve_call(self, recv, name, argc, t, f, chain, cvars, loc, last, smembers, swild):
+        """-> (label, kind, target ids, return type of the target)"""
+        # ---- this(...) / super(...) constructor delegation
+        if recv == "" and name in ("this", "super"):
+            entry = (t, f) if name == "this" else None
+            if name == "super":
+                for sup in t.get("ext", []):
+                    entry = self.resolve(sup, f)
+                    if entry:
+                        break
+                if entry is None:
+                    sup = t["ext"][0] if t.get("ext") else "Object"
+                    return ("super(…) → " + _simple(sup), "x", [], None)
+            hits = self.find_ctors(entry, argc)
+            return ("new " + entry[0]["n"] + " (" + name + "(…))", "i" if hits else "x",
+                    [h["id"] for h in hits], None)
+        segs = recv.split(".") if recv and not recv.startswith("new:") else [recv]
+        if "this" in segs:                       # this.x / Outer.this.x
+            segs = segs[len(segs) - segs[::-1].index("this"):]
+        # ---- unqualified call: own class, enclosing classes, parents, static imports
+        if segs in ([""], []):
+            for ct in chain:
+                hits = self.find_methods((ct, f), name, argc)
+                if hits:
+                    owner = self.owner.get(hits[0]["id"], (ct, f))[0]
+                    return self._hit(owner["n"], name, hits)
+            if recv == "":
+                cls = smembers.get(name)
+                for c in ([cls] if cls else swild):
+                    e = self.resolve(c, f)
+                    if e:
+                        hits = self.find_methods(e, name, argc)
+                        if hits:
+                            return self._hit(e[0]["n"], name, hits)
+                    elif cls:
+                        return (cls + "." + name, "x", [], None)
+                unresolved_wild = [w for w in swild if not self.resolve(w, f)]
+                if len(unresolved_wild) == 1:
+                    return (unresolved_wild[0] + "." + name, "x", [], None)
+            for ct in chain:                    # values(), valueOf(), ordinal() … of an enum
+                if ct["k"] == "enum" and name in self.ENUM_BUILTINS:
+                    return (ct["n"] + "." + name + " (enum built-in)", "x", [], ct["n"] + "[]" if name == "values" else None)
+            for ct in chain:                    # inherited from a library parent class
+                for sup in ct.get("ext", []):
+                    if not self.resolve(sup, f):
+                        return (_simple(sup) + "." + name, "x", [], None)
+            return (name, "u", [], None)
+        # ---- super.method()
+        if segs == ["super"]:
+            for sup in t.get("ext", []):
+                e = self.resolve(sup, f)
+                if not e:
+                    return (_simple(sup) + "." + name, "x", [], None)
+                hits = self.find_methods(e, name, argc)
+                if hits:
+                    return self._hit(self.owner[hits[0]["id"]][0]["n"], name, hits)
+            return ("Object." + name, "x", [], None)
+        # ---- typed receiver
+        first, rest, ctxf, typ = segs[0], segs[1:], f, None
+        if first.startswith("new:"):
+            typ = first[4:]
+        elif first.endswith("()"):
+            prev = last.get(first[:-2])
+            if prev is None:
+                return (first[:-2] + "(…)." + name, "u", [], None)
+            if prev[0] != "i" or not prev[1]:
+                return (first[:-2] + "(…)." + name, "x" if prev[0] == "x" else "u", [], None)
+            typ = prev[1]
+        elif first == '""':
+            typ = "String"
+        elif first in loc:
+            typ = loc[first]
+        elif first in cvars:
+            typ = cvars[first]
+        elif first[:1].isupper():
+            typ = first
+        else:
+            ups = [i for i, x in enumerate(segs) if x[:1].isupper()]
+            if not ups:
+                return (recv + "." + name, "u", [], None)
+            typ, rest = segs[ups[0]], segs[ups[0] + 1:]      # java.util.Collections.sort
+        for seg in rest:
+            e = self.resolve(typ, ctxf)
+            if e:
+                ft = self.field_type(e, seg)
+                if ft:
+                    typ, ctxf = ft
+                    continue
+                if seg[:1].isupper():
+                    typ = seg
+                    continue
+                return (e[0]["n"] + "." + seg + "." + name, "u", [], None)
+            if seg[:1].isupper():
+                typ = seg
+                continue
+            return (_simple(typ) + "." + seg + "." + name, "x", [], None)   # System.out.println
+        simple = _simple(typ)
+        if typ == "var" or not simple:
+            return (recv + "." + name, "u", [], None)
+        e = self.resolve(typ, ctxf)
+        if not e:
+            if _GENERIC_VAR.fullmatch(simple):
+                return (simple + "." + name, "u", [], None)
+            return (simple + "." + name, "x" if simple[:1].isupper() else "u", [], None)
+        hits = self.find_methods(e, name, argc)
+        if hits:
+            return self._hit(self.owner[hits[0]["id"]][0]["n"], name, hits)
+        if e[0]["k"] == "record" and argc == 0:
+            comp = [fl for fl in e[0].get("f", []) if fl["n"] == name and fl.get("comp")]
+            if comp:
+                return (e[0]["n"] + "." + name + "() (record accessor)", "x", [], comp[0]["t"])
+        return (e[0]["n"] + "." + name, "x", [], None)    # inherited from a library parent
+
+    def implementations(self, mid):
+        m = self.methods.get(mid)
+        ot = self.owner.get(mid, (None, None))[0]
+        if not m or not ot or m["k"] != "method":
+            return []
+        if ot["k"] != "interface" and "abstract" not in m.get("m", []):
+            return []
+        out = []
+        for it, _f in self.implementers.get(ot["n"], [])[:8]:
+            for x in it.get("fn", []):
+                if x["k"] == "method" and x["n"] == m["n"] and len(x.get("p", [])) == len(m.get("p", [])):
+                    out.append(x["id"])
+        return out
+
+    def resolve_source(self, src, t, f, chain, cvars, smembers, swild):
+        loc = src.get("loc", {})
+        last = {}
+        out = []
+        for recv, name, argc, line in src.get("calls", []):
+            label, kind, targets, rtype = self.resolve_call(recv, name, argc, t, f, chain, cvars, loc,
+                                                            last, smembers, swild)
+            last[name] = (kind, rtype)
+            impls = []
+            for tid in targets:
+                impls += [x for x in self.implementations(tid) if x not in targets and x not in impls]
+            out.append([line, label, kind, targets, impls])
+        for typ, argc, line in src.get("news", []):
+            e = self.resolve(typ, f)
+            if e:
+                hits = self.find_ctors(e, argc)
+                out.append([line, "new " + e[0]["n"], "i", [h["id"] for h in hits] or [e[0]["id"]], []])
+            else:
+                out.append([line, "new " + _simple(typ), "x", [], []])
+        out.sort(key=lambda c: c[0])
+        return out[:self.MAX_CALLS]
+
+    def run(self):
+        stats = Counter()
+        called_by = defaultdict(set)
+        for f in self.files:
+            if not f.get("types"):
+                continue
+            smembers, swild = self.static_imports(f)
+            for t in _walk_types(f["types"]):
+                chain = self.chain(t)
+                cvars = self.type_vars(t, f)
+                sources = [(m["id"], m) for m in t.get("fn", [])]
+                if t.get("fi"):
+                    sources.append((t["id"], t["fi"]))
+                for caller, src in sources:
+                    entries = self.resolve_source(src, t, f, chain, cvars, smembers, swild)
+                    for e in entries:
+                        stats[e[2]] += 1
+                        for tid in e[3] + e[4]:
+                            if tid[0] == "M":
+                                called_by[tid].add(caller)
+                    if entries:
+                        if caller[0] == "M":
+                            src["cl"] = entries
+                        else:
+                            t["fcl"] = entries
+        for mid, callers in called_by.items():
+            self.methods[mid]["cb"] = sorted(callers, key=_id_key)
+        return {"in_repo": stats["i"], "library": stats["x"], "unresolved": stats["u"]}
+
+    def unused_private(self):
+        for mid, m in self.methods.items():
+            if m["k"] != "method" or "private" not in m.get("m", []) or m.get("a") or m.get("test"):
+                continue
+            if m["n"] in self.UNUSED_OK:
+                continue
+            if not [c for c in m.get("cb", []) if c != mid]:
+                yield mid, m, self.owner[mid]
+
+
+# --------------------------------------------------------------------------- #
 #  Analysis driver                                                             #
 # --------------------------------------------------------------------------- #
 
@@ -1505,6 +1797,10 @@ def analyze(files, dirs, opts, project):
     linker = Linker(files)
     linker.method_owner = method_owner
     link_stats = linker.link()
+
+    # ---- calls inside each function + called by
+    resolver = CallResolver(files)
+    call_stats = resolver.run()
 
     java = [f for f in files if f.get("lang") == "java"]
     main_java = [f for f in java if not f.get("test")]
@@ -1672,6 +1968,8 @@ def analyze(files, dirs, opts, project):
                         not (m.get("test") and re.fullmatch(r"[a-z][A-Za-z0-9_]*", m["n"])):
                     add("info", "Naming: method", f, "Method '%s.%s' is not camelCase" % (t["n"], m["n"]),
                         m["id"], m["l"])
+    for mid, m, (t, f) in resolver.unused_private():
+        add("info", "Unused private method", f, "%s.%s is private and never called" % (t["n"], m["n"]), mid, m["l"])
     for row in folder_rows:
         fl = folders[row["d"] if row["d"] != "(root)" else ""]
         if row["n"] >= 4 and row["cons"] < 60 and not any(x.get("lang") == "java" for x in fl):
@@ -1719,7 +2017,7 @@ def analyze(files, dirs, opts, project):
         "test_methods": n_test_methods, "java_lines": sum(f.get("ln", 0) for f in java),
         "langs": dict(langs.most_common()), "build_files": build[:50],
         "source_roots": dict(roots.most_common(20)), "organisation": org,
-        "layer_share": round(layer_share), "link_stats": dict(link_stats),
+        "layer_share": round(layer_share), "link_stats": dict(link_stats), "call_stats": call_stats,
         "coverage_total": dict(tot), "keep_calls": opts.keep_calls,
         "thresholds": {"max_methods": opts.max_methods, "max_class_lines": opts.max_class_lines,
                        "max_method_lines": opts.max_method_lines, "max_params": opts.max_params},
@@ -1731,6 +2029,8 @@ def analyze(files, dirs, opts, project):
 def prune_for_output(files, keep_calls):
     for f in files:
         for t in _walk_types(f.get("types", [])):
+            if not keep_calls:
+                t.pop("fi", None)
             for key in ("m", "a", "ext", "impl", "f", "fn", "nt"):
                 if key in t and not t[key]:
                     del t[key]
@@ -1941,6 +2241,11 @@ summary:hover,.m:hover,.fld:hover,.row:hover{background:var(--soft)}
 .dt-library{color:#1f4e8c}
 .legend-row{display:flex;flex-wrap:wrap;gap:4px 6px;align-items:center;font-size:11.5px;color:var(--muted);margin:0 0 10px}
 .legend-row .sp{width:10px}
+.cc{color:var(--muted);font:10.5px system-ui,sans-serif;white-space:nowrap}
+.cc.zero{color:#c0392b}
+#panel tr.call-x td,#panel tr.call-u td{color:var(--muted)}
+.only-repo tr.call-x,.only-repo tr.call-u{display:none}
+.callsig{color:var(--muted);font-size:11px}
 .legend-row .ty{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .ic{display:inline-block;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;font:700 9.5px system-ui,sans-serif;color:#fff;margin-right:5px;vertical-align:1px}
 .ic.dir{background:none;color:#a08a3c;font-size:12px;border-radius:2px}
@@ -2014,7 +2319,8 @@ h2{font-size:15px;margin:18px 0 8px}
         <input id="q" placeholder="Search class, method, file, or object type (min 2 chars)…" autocomplete="off">
         <label><input type="checkbox" id="optPriv" checked> private</label>
         <label><input type="checkbox" id="optFields" checked> fields</label>
-        <button id="expand">Expand all</button>
+        <button id="expandFn" title="Open folders, files and classes so every function is visible (field lists stay closed)">Expand functions</button>
+        <button id="expand" title="Open everything, including field lists">Expand all</button>
         <button id="collapse">Collapse all</button>
       </div>
       <div class="legend-row" id="idlegend">
@@ -2026,6 +2332,7 @@ h2{font-size:15px;margin:18px 0 8px}
         <span class="id id-enum">enum</span>enum
         <span class="id id-type">class</span>data type
         <span class="id id-field">var</span>field
+        <span class="cc">→3 ←2</span>calls into repo / called by
         <span class="sp"></span><b>Data types:</b>
         <span class="ty dt-primitive">int</span>primitive
         <span class="ty dt-value">String</span>value
@@ -2311,6 +2618,42 @@ function fieldRow(fl, t) {
   r.innerHTML = `<span class="vis ${v[0]}">${v[1]}</span>${fieldIds(fl, t)}${ty(fl.t)} <span>${esc(fl.n)}</span>${annoChips(fl.a, 2)}${fl.mock ? '<span class="chip">mock</span>' : ''}${fl.comp ? '<span class="chip">component</span>' : ''}<span class="ln">L${fl.l}</span>`;
   return r;
 }
+function isUnusedPrivate(m) {
+  return m.k === 'method' && (m.m || []).includes('private') && !m.test && !(m.a && m.a.length)
+    && !(m.cb || []).some(id => id !== m.id);
+}
+function callChip(m) {
+  const nc = (m.cl || []).filter(c => c[2] === 'i').length, nb = (m.cb || []).length;
+  const unused = isUnusedPrivate(m);
+  return `<span class="cc${unused ? ' zero' : ''}" title="${nc} call(s) into this repo · called by ${nb}${unused ? ' — private and never called' : ''}">→${nc} ←${nb}</span>`;
+}
+function callRow(c) {
+  const ln = c[0], label = c[1], k = c[2], tg = c[3] || [], im = c[4] || [];
+  let who;
+  if (k === 'i') {
+    who = tg.length ? tg.map(id => {
+      if (id[0] === 'T') return `<a class="go" data-t="${id}">${esc(label)}</a> <span class="callsig">(default constructor)</span>`;
+      const x = ME[id];
+      const sig = x ? ' <span class="callsig mono">(' + (x.p || []).map(p => esc(p[1])).join(', ') + ') → ' + esc(x.k === 'ctor' ? 'new' : (x.r || 'void')) + '</span>' : '';
+      return `<a class="go" data-m="${id}">${esc(label)}</a>${sig}`;
+    }).join('<br>') : esc(label);
+    if (im.length) who += '<div class="callsig">implemented by: ' + im.map(mLink).join(', ') + '</div>';
+  } else if (k === 'x') {
+    const builtin = /\((record accessor|enum built-in)\)|super\(…\)/.test(label);
+    who = `<span class="mono">${esc(label)}</span> <span class="chip" title="${builtin ? 'generated by Java for this type' : 'method of a library or JDK type'}">${builtin ? 'built-in' : 'library/JDK'}</span>`;
+  } else {
+    who = `<span class="mono">${esc(label)}</span> <span class="chip warn" title="The type of the object this is called on could not be worked out">? unresolved</span>`;
+  }
+  return `<tr class="call-${k}"><td class="muted" style="width:46px">L${ln}</td><td>${who}</td></tr>`;
+}
+function callsSection(cl, title) {
+  const ni = cl.filter(c => c[2] === 'i').length, nx = cl.filter(c => c[2] === 'x').length, nu = cl.filter(c => c[2] === 'u').length;
+  return `<h4>${title} (${cl.length}) <span style="text-transform:none;letter-spacing:0;font-weight:400">— ${ni} in this repo · ${nx} library/JDK/built-in · ${nu} unresolved</span></h4>` +
+    (cl.length ? `<label class="muted" style="font-size:12px;display:flex;gap:5px;align-items:center;margin-bottom:4px"><input type="checkbox" class="onlyRepo"> only calls into this repo</label><table class="callTable"><tr><th>Line</th><th>Calls</th></tr>${cl.map(callRow).join('')}</table>` : '<p class="muted">No calls</p>');
+}
+function wireCallToggles() {
+  P.querySelectorAll('.onlyRepo').forEach(cb => cb.onchange = () => cb.parentElement.nextElementSibling.classList.toggle('only-repo', cb.checked));
+}
 function methodRow(m) {
   const r = document.createElement('div');
   const v = vis(m.m, m._t);
@@ -2320,7 +2663,7 @@ function methodRow(m) {
   r.innerHTML = `<span class="vis ${v[0]}">${v[1]}</span>${methodIds(m)}<span class="nm">${esc(m.n)}</span>`
     + (m.k !== 'init' ? `<span class="io"><span class="tag in">IN</span>${paramsHTML(m)}</span><span class="io"><span class="tag out">OUT</span>${outHTML(m)}</span>` : '')
     + (m.th ? `<span class="muted">throws ${esc(m.th.join(', '))}</span>` : '')
-    + annoChips(annos, 2) + testBadge(m) + `<span class="ln">L${m.l}</span>`;
+    + annoChips(annos, 2) + testBadge(m) + callChip(m) + `<span class="ln">L${m.l}</span>`;
   return r;
 }
 
@@ -2438,7 +2781,16 @@ function showMethod(id) {
     ${m.k !== 'init' ? `<h4><span class="tag in">IN</span> Inputs (${(m.p || []).length})</h4>${rows ? '<table><tr><th>#</th><th>Data type (object)</th><th>Name</th><th>Annotations</th></tr>' + rows + '</table>' : '<p class="muted">No parameters</p>'}
     <h4><span class="tag out">OUT</span> Output</h4><div class="mono">${outHTML(m)}</div>
     ${m.th ? `<h4>Throws</h4><div class="mono">${esc(m.th.join(', '))}</div>` : ''}` : ''}
+    ${callsSection(m.cl || [], 'Calls')}
+    <h4>Called by (${(m.cb || []).length})</h4>${isUnusedPrivate(m) && (m.cb || []).length ? '<p class="chip warn" style="display:inline-block">⚠ Only calls itself — this private method looks unused.</p>' : ''}${list(m.cb || [], id => id[0] === 'T'
+      ? tLink(id) + ' <span class="muted">(field initializer)</span>'
+      : mLink(id) + (ME[id] && ME[id].test ? ' <span class="chip test">test</span>' : '') + (ME[id] ? ' <span class="muted" style="font-size:11.5px">' + esc(ME[id]._t._f.p) + ':' + ME[id].l + '</span>' : ''),
+      m.k === 'ctor' ? 'Not created with <code>new</code> anywhere in the scanned code.'
+      : m.k === 'init' ? 'Runs automatically when the class is loaded / created.'
+      : (m.m || []).includes('private') ? '⚠ Never called — this private method looks unused.'
+      : 'Not called anywhere in the scanned code (it may be called by a framework, by reflection, or by code outside this repo).')}
     ${tests}`;
+  wireCallToggles();
 }
 function showType(id) {
   const t = TY[id]; if (!t) return;
@@ -2461,7 +2813,9 @@ function showType(id) {
     ${tests}
     <h4>Fields (${(t.f || []).length})</h4>${fr ? '<table><tr><th>Kind</th><th>Modifiers</th><th>Data type</th><th>Name</th></tr>' + fr + '</table>' : '<p class="muted">None</p>'}
     <h4>Methods (${(t.fn || []).length})</h4>${mr ? '<table><tr><th>Name</th><th><span class="tag in">IN</span></th><th><span class="tag out">OUT</span></th></tr>' + mr + '</table>' : '<p class="muted">None</p>'}
-    ${t.nt && t.nt.length ? '<h4>Nested types</h4>' + list(t.nt.map(x => x.id), tLink, '') : ''}`;
+    ${t.nt && t.nt.length ? '<h4>Nested types</h4>' + list(t.nt.map(x => x.id), tLink, '') : ''}
+    ${t.fcl ? callsSection(t.fcl, 'Calls in field initializers') : ''}`;
+  wireCallToggles();
 }
 function showFile(p) {
   const f = FI[p]; if (!f) return;
@@ -2478,7 +2832,9 @@ function introPanel() {
   P.innerHTML = `<h3>How to read this report</h3>
   <p class="muted"><b>Structure</b>: expand folders → files → classes → methods. Each method shows <span class="tag in">IN</span> parameter types (objects) and names, and <span class="tag out">OUT</span> the return type.</p>
   <p class="muted">Visibility: <span class="vis pub mono">+</span> public · <span class="vis prot mono">#</span> protected · <span class="vis pkg mono">~</span> package · <span class="vis priv mono">−</span> private.</p>
-  <p class="muted"><b>Expand all</b> opens every folder, file, class and method; <b>Collapse all</b> closes them. The coloured labels (ƒ function, const, static, enum, class…) and the colours of data types are explained above the tree.</p>
+  <p class="muted"><b>Expand functions</b> opens folders, files and classes so every function is visible (field lists stay closed). <b>Expand all</b> also opens the field lists; <b>Collapse all</b> closes everything.</p>
+  <p class="muted">Click a method to see <b>Calls</b> (every function it calls, in order, with line numbers — calls into this repo are clickable, library/JDK calls are grey) and <b>Called by</b> (every function that calls it). On each row, <span class="cc">→3 ←2</span> means 3 calls into this repo and called by 2.</p>
+  <p class="muted"> The coloured labels (ƒ function, const, static, enum, class…) and the colours of data types are explained above the tree.</p>
   <p class="muted">Click any class, method or file to see details here. Switch <b>Folders / Packages</b> at the top of the Structure tab.</p>
   <p class="muted"><b>Tests</b>: <span class="chip ok">✓ tested</span> = a test method calls this method directly (technique 3). “strong” = that test also belongs to the matching test class by name (technique 1 + 3).</p>`;
 }
@@ -2523,18 +2879,22 @@ function syncSeg() { document.querySelectorAll('#viewseg button').forEach(b => b
 document.querySelectorAll('#viewseg button').forEach(b => b.onclick = () => { VIEW = b.dataset.view; syncSeg(); renderTree(); });
 $('#optPriv').onchange = e => $('#tree').classList.toggle('hide-priv', !e.target.checked);
 $('#optFields').onchange = e => $('#tree').classList.toggle('hide-fields', !e.target.checked);
-$('#expand').onclick = expandAll;
-function expandAll() {
-  const tree = $('#tree'), btn = $('#expand');
+$('#expand').onclick = () => expandTree(false);
+$('#expandFn').onclick = () => expandTree(true);
+function expandTree(onlyFunctions) {
+  const tree = $('#tree'), btn = $(onlyFunctions ? '#expandFn' : '#expand'), label = btn.textContent;
   const total = M.methods || 0;
-  if (total > 40000 && !confirm('This repo has ' + fmtN(total) + ' methods. Expanding everything may take a while. Continue?')) return;
-  btn.disabled = true; btn.textContent = 'Expanding…';
+  if (total > 40000 && !confirm('This repo has ' + fmtN(total) + ' methods. Expanding may take a while. Continue?')) return;
+  const btns = [$('#expand'), $('#expandFn')];
+  btns.forEach(b => b.disabled = true); btn.textContent = 'Expanding…';
+  const sel = onlyFunctions ? 'details:not([open]):not(.fields)' : 'details:not([open])';
+  const done = () => { btns.forEach(b => b.disabled = false); btn.textContent = label; };
   (function step() {
-    const closed = tree.querySelectorAll('details:not([open])');
-    if (!closed.length) { btn.disabled = false; btn.textContent = 'Expand all'; return; }
+    if (onlyFunctions) tree.querySelectorAll('details.fields[open]').forEach(d => d.open = false);
+    const closed = tree.querySelectorAll(sel);
     let n = 0;
     for (const d of closed) { if (d.closest('.hide')) continue; openD(d); if (++n >= 500) break; }
-    if (!n) { btn.disabled = false; btn.textContent = 'Expand all'; return; }
+    if (!n) { if (onlyFunctions) tree.querySelectorAll('details.fields[open]').forEach(d => d.open = false); return done(); }
     requestAnimationFrame(step);
   })();
 }
@@ -2580,6 +2940,7 @@ function renderOverview() {
     </div>
     <div class="legend">Organisation: <b>${esc(M.organisation)}</b> (${M.layer_share}% of main Java files sit in layer-named packages).
       ${M.build_files.length ? '<br>Build files: ' + M.build_files.slice(0, 8).map(esc).join(', ') : ''}
+      ${M.call_stats ? '<br>Calls inside functions: <b>' + fmtN(M.call_stats.in_repo) + '</b> resolved to code in this repo · ' + fmtN(M.call_stats.library) + ' library/JDK · ' + fmtN(M.call_stats.unresolved) + ' unresolved' : ''}
       <br>Scanned ${esc(M.scanned)} in batches of ${fmtN(M.batch_size)} files · analyzer v${esc(M.version)}</div>
     <h2>Types by kind</h2>${bars(ty, Object.values(ty).reduce((a, b) => a + b, 0))}
     <h2>Files by type (extension)</h2>${bars(M.langs, M.files)}
